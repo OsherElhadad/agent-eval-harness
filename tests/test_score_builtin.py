@@ -289,6 +289,92 @@ class TestStructuredJudge:
             val, rat = score._call_structured_judge("p", "m", "score")
         assert val == 3 and rat == "adequate"
 
+    # --- Step-down to tool_choice auto (#265) ---
+
+    _SONNET_REFUSAL = ('tool_choice: type "tool" and "any" are not supported '
+                       'for this model.')
+
+    def _scripted(self, *script):
+        """Anthropic-shaped client replaying `script`: an exception is raised,
+        anything else returned. Each call's kwargs are kept on `.calls`."""
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            step = script[len(calls) - 1]
+            if isinstance(step, BaseException):
+                raise step
+            return step
+
+        client = SimpleNamespace(messages=SimpleNamespace(create=create))
+        client.calls = calls
+        return client
+
+    def _structured(self, client, feedback_type="bool"):
+        import score
+        score._reset_judge_call_meta()
+        score._reset_tool_choice_fallbacks()
+        with patch("score._get_anthropic_client", return_value=client):
+            outcome = score._call_structured_judge("p", "m", feedback_type)
+        return outcome, score._pop_judge_call_meta()
+
+    def test_tool_choice_400_steps_down_once_to_auto(self):
+        import score
+        client = self._scripted(
+            _HttpError(400, self._SONNET_REFUSAL),
+            self._resp(self._tool_use(
+                "submit_evaluation", {"passed": True, "rationale": "complete"})))
+        (val, rat), mode = self._structured(client)
+        assert val is True and rat == "complete"
+        assert [c["tool_choice"] for c in client.calls] == [
+            {"type": "tool", "name": "submit_evaluation"}, {"type": "auto"}]
+        # Same tool, same system prompt (which tells the model to call it).
+        assert client.calls[0]["tools"] == client.calls[1]["tools"]
+        assert client.calls[0]["system"] == client.calls[1]["system"]
+        assert mode == "auto" and score._tool_choice_fallback_count() == 1
+
+    def test_tool_choice_400_relayed_in_body_steps_down(self):
+        body = {"type": "error", "error": {"type": "invalid_request_error",
+                                           "message": self._SONNET_REFUSAL}}
+        client = self._scripted(
+            _HttpError(400, "Error code: 400", body=body),
+            self._resp(self._tool_use(
+                "submit_score", {"score": 4, "rationale": "solid"})))
+        (val, _), mode = self._structured(client, "score")
+        assert val == 4 and mode == "auto" and len(client.calls) == 2
+
+    def test_forced_tool_choice_accepted_sends_one_unchanged_request(self):
+        import score
+        client = self._scripted(self._resp(self._tool_use(
+            "submit_evaluation", {"passed": False, "rationale": "missing"})))
+        (val, _), mode = self._structured(client)
+        assert val is False and len(client.calls) == 1
+        assert client.calls[0]["tool_choice"] == {
+            "type": "tool", "name": "submit_evaluation"}
+        assert mode is None and score._tool_choice_fallback_count() == 0
+
+    def test_unrelated_400_is_not_retried(self):
+        client = self._scripted(
+            _HttpError(400, "messages: at least one message is required"))
+        with pytest.raises(_HttpError):
+            self._structured(client)
+        assert len(client.calls) == 1
+
+    def test_auto_text_only_response_uses_text_parse_fallback(self):
+        client = self._scripted(
+            _HttpError(400, self._SONNET_REFUSAL),
+            self._resp(self._text('{"score": 2, "rationale": "thin"}')))
+        (val, rat), mode = self._structured(client, "score")
+        assert val == 2 and rat == "thin" and mode == "auto"
+
+    def test_second_tool_choice_400_surfaces_as_error(self):
+        client = self._scripted(
+            _HttpError(400, self._SONNET_REFUSAL),
+            _HttpError(400, self._SONNET_REFUSAL))
+        with pytest.raises(_HttpError):
+            self._structured(client)
+        assert len(client.calls) == 2
+
 
 class TestSampleAggregation:
 

@@ -325,3 +325,83 @@ def test_compare_runs_without_usage_has_no_judge_usage_block():
         result = score.compare_runs(Path("a"), Path("b"), EvalConfig(name="t", skill="s"),
                                     ["case-1"], model="openai:/gpt-4o")
     assert "judge_usage" not in result
+
+
+# --- Anthropic step-down to tool_choice auto (#265) ---------------------------
+
+class _BadRequest(Exception):
+    """Stands in for anthropic.BadRequestError without importing the SDK."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.status_code = 400
+        self.message = message
+        self.body = None
+
+
+_REFUSAL = 'tool_choice: type "tool" and "any" are not supported for this model.'
+
+
+def _anthropic_response(*blocks, stop_reason="end_turn"):
+    return SimpleNamespace(id="msg_pw", model="claude-sonnet-5-5", content=list(blocks),
+                           stop_reason=stop_reason,
+                           usage=SimpleNamespace(input_tokens=10, output_tokens=2))
+
+
+def _scripted_anthropic(*script):
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        step = script[len(calls) - 1]
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    client = SimpleNamespace(messages=SimpleNamespace(create=create))
+    client.calls = calls
+    return client
+
+
+def test_call_judge_anthropic_steps_down_to_auto_on_tool_choice_400():
+    block = SimpleNamespace(type="tool_use", name="submit_comparison",
+                            input={"reasoning": "r", "preferred": "A"})
+    client = _scripted_anthropic(_BadRequest(_REFUSAL), _anthropic_response(block))
+    score._reset_judge_call_meta()
+    verdict, err = score._call_judge("anthropic", client, "sys", "msg", "claude-sonnet-5-5")
+    assert err is None and verdict["preferred"] == "A"
+    assert [c["tool_choice"] for c in client.calls] == [
+        {"type": "tool", "name": "submit_comparison"}, {"type": "auto"}]
+    assert client.calls[0]["tools"] == client.calls[1]["tools"]
+    assert score._pop_judge_call_meta() == "auto"
+
+
+def test_call_judge_anthropic_auto_text_only_is_parsed():
+    text = SimpleNamespace(type="text", text='{"reasoning": "close", "preferred": "tie"}')
+    client = _scripted_anthropic(_BadRequest(_REFUSAL), _anthropic_response(text))
+    verdict, err = score._call_judge("anthropic", client, "sys", "msg", "claude-sonnet-5-5")
+    assert err is None and verdict["preferred"] == "tie" and len(client.calls) == 2
+
+
+def test_call_judge_anthropic_forced_accepted_sends_one_request():
+    block = SimpleNamespace(type="tool_use", name="submit_comparison",
+                            input={"reasoning": "r", "preferred": "B"})
+    client = _scripted_anthropic(_anthropic_response(block, stop_reason="tool_use"))
+    verdict, err = score._call_judge("anthropic", client, "sys", "msg", "claude-sonnet-5")
+    assert err is None and verdict["preferred"] == "B"
+    assert len(client.calls) == 1
+    assert client.calls[0]["tool_choice"] == {"type": "tool", "name": "submit_comparison"}
+
+
+def test_call_judge_anthropic_unrelated_400_is_not_retried():
+    client = _scripted_anthropic(_BadRequest("messages: at least one message is required"))
+    verdict, err = score._call_judge("anthropic", client, "sys", "msg", "claude-sonnet-5-5")
+    assert verdict is None and "at least one message" in err
+    assert len(client.calls) == 1
+
+
+def test_call_judge_anthropic_second_tool_choice_400_is_an_error():
+    client = _scripted_anthropic(_BadRequest(_REFUSAL), _BadRequest(_REFUSAL))
+    verdict, err = score._call_judge("anthropic", client, "sys", "msg", "claude-sonnet-5-5")
+    assert verdict is None and "tool_choice" in err
+    assert len(client.calls) == 2

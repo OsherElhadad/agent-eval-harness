@@ -1258,6 +1258,29 @@ def _call_judge_llm(prompt, model, system_prompt, images=None, max_tokens=4096):
     return response.content[0].text.strip()
 
 
+def _anthropic_judge_request(client, tool_name, **kwargs):
+    """One Anthropic judge request forcing `tool_name`. Returns the response.
+
+    Some Claude models refuse forced tool choice outright (Sonnet 5.5 on
+    Vertex: `400 tool_choice: type "tool" and "any" are not supported for this
+    model`). On a 400 that names `tool_choice` — and only then — the request is
+    sent once more with `tool_choice: auto`: same tool, same system prompt
+    telling the model to call it. The step-down is recorded as
+    `tool_choice_mode` "auto", as the OpenAI-shaped ladder does. A model that
+    accepts the forced request is sent exactly the request it always was, and a
+    second failure propagates as the judge error.
+    """
+    try:
+        return client.messages.create(
+            tool_choice={"type": "tool", "name": tool_name}, **kwargs)
+    except Exception as exc:
+        if not _is_tool_choice_rejection(exc):
+            raise
+    response = client.messages.create(tool_choice={"type": "auto"}, **kwargs)
+    _record_tool_choice_mode("auto")
+    return response
+
+
 def _call_structured_judge(prompt, model, feedback_type, images=None,
                            max_tokens=4096, bounds=None):
     """Call an LLM judge with forced tool output. Returns (value, rationale).
@@ -1279,12 +1302,12 @@ def _call_structured_judge(prompt, model, feedback_type, images=None,
     parser = (_parse_bool_response if is_bool
               else lambda text: _parse_score_response(text, bounds))
     client = _get_anthropic_client()
-    response = client.messages.create(
+    response = _anthropic_judge_request(
+        client, tool["name"],
         model=model,
         max_tokens=max_tokens,
         system=system_prompt,
         tools=[tool],
-        tool_choice={"type": "tool", "name": tool["name"]},
         messages=[{"role": "user", "content": _judge_user_message(prompt, images)}],
     )
     usage = _usage_from_anthropic_response(response, model)
@@ -1306,7 +1329,8 @@ def _call_structured_judge(prompt, model, feedback_type, images=None,
                 except (KeyError, TypeError, ValueError):
                     pass
     if verdict is None:
-        # Fallback: model emitted text instead of a tool call (rare with tool_choice).
+        # Fallback: model emitted text instead of a tool call (rare when the
+        # tool is forced; possible after a step-down to tool_choice auto).
         text = "".join(getattr(b, "text", "") for b in response.content
                        if getattr(b, "type", None) == "text").strip()
         verdict = parser(text)
@@ -4036,11 +4060,11 @@ def _call_judge(backend, client, system_prompt, user_message, model,
         return _call_pairwise_openai(client, system_prompt, user_message, model,
                                      max_tokens=max_tokens, **openai_kwargs)
     try:
-        response = client.messages.create(
+        response = _anthropic_judge_request(
+            client, "submit_comparison",
             model=model, max_tokens=max_tokens,
             system=_PAIRWISE_SYSTEM,
             tools=[_PAIRWISE_TOOL],
-            tool_choice={"type": "tool", "name": "submit_comparison"},
             messages=[
                 {"role": "user", "content": f"{system_prompt}\n\n{user_message}"},
             ],
@@ -4051,7 +4075,8 @@ def _call_judge(backend, client, system_prompt, user_message, model,
         for block in response.content:
             if getattr(block, "type", None) == "tool_use" and block.name == "submit_comparison":
                 return {**dict(block.input), "_usage": usage}, None
-        # Fallback: model emitted text despite tool_choice (rare) — parse it.
+        # Fallback: model emitted text despite a forced tool_choice (rare), or
+        # after a step-down to tool_choice auto — parse it.
         text = "".join(getattr(b, "text", "") for b in response.content
                        if getattr(b, "type", None) == "text")
         parsed = _extract_judge_json(text) if text else None
