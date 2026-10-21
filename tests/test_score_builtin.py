@@ -13,6 +13,16 @@ from agent_eval.config import EvalConfig, JudgeConfig, ModelsConfig, OutputConfi
 from score import load_judges, score_cases
 
 
+class _HttpError(Exception):
+    def __init__(self, status_code, message, retry_after=None, body=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+        self.body = body
+        headers = {"retry-after": retry_after} if retry_after is not None else {}
+        self.response = SimpleNamespace(headers=headers)
+
+
 class TestLoadJudgesBuiltin:
 
     def test_builtin_python_judge(self):
@@ -1632,16 +1642,6 @@ def _or_client(*script):
         completions=SimpleNamespace(create=create)))
     client.calls = calls
     return client
-
-
-class _HttpError(Exception):
-    def __init__(self, status_code, message, retry_after=None, body=None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.message = message
-        self.body = body
-        headers = {"retry-after": retry_after} if retry_after is not None else {}
-        self.response = SimpleNamespace(headers=headers)
 
 
 def _routing_404():
