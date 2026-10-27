@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented. See `docs/capevolve-poc.md` for the user-facing reference.
+Implemented.
 
 ## Problem
 
@@ -225,8 +225,6 @@ Check progress from any later session, and apply the winner once finished:
 agent-eval-capevolve --status
 agent-eval-capevolve --apply
 ```
-
-Full command/flag reference and output shapes: `docs/capevolve-poc.md`.
 
 ## Alternatives Considered
 

@@ -20,8 +20,8 @@ the interactive loop below — skip every other step in this file. Parse only
 `--pilot-case-ids`, `--runner-budget-usd`, `--runner`, `--env`, `--image`, `--reintake`,
 `--optimizer`, `--optimizer-model`, `--skills-dir`, `--status`, and `--apply`
 from the arguments (ignore `--model`/`--run-id`/`--target-judge`, which don't
-apply here). See `docs/capevolve-poc.md` for what each mode does and the
-current scope limits (local or Harbor substrate; EvalHub is refused). Do not proceed to Step 1 below for a
+apply here). Note the current scope limits (local or Harbor
+substrate; EvalHub is refused). Do not proceed to Step 1 below for a
 `--engine capevolve` invocation. The underlying command for every mode is
 `python3 ${CLAUDE_SKILL_DIR}/scripts/capevolve.py <flags>`, run from the
 benchmark's root (`--config` defaults to the benchmark's eval config).

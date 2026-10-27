@@ -55,9 +55,6 @@ Includes builtin documentation generation prompts (navigation, anti-pattern, aut
 
 Prompt mode provides direct agent invocation with LLM rubric judges and flexible evaluation criteria.
 
-The optional cap-evolve integration (`agent-eval-capevolve`, `/eval-optimize
---engine capevolve`) is documented in `docs/capevolve-poc.md`.
-
 ## Architecture
 
 ```
