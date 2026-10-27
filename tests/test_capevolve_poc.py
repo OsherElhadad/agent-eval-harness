@@ -15,6 +15,33 @@ from agent_eval.engines import capevolve
 from agent_eval.engines import _bridge_template as bridge_template
 from agent_eval.optimize import artifact, intake, rollout
 
+# cap-evolve's real templates/project, when a local install carries one
+# (an editable install, or $CAPEVOLVE_SKILLS_DIR next to a checkout).
+_LOCAL_CAPEVOLVE_TEMPLATES = capevolve._cap_evolve_templates(os.environ.get("CAPEVOLVE_SKILLS_DIR"))
+# The real implementations, for the tests that exercise them directly.
+_REAL_FETCH_TREE = capevolve._fetch_tree
+_REAL_REQUIRE_CAP_EVOLVE = capevolve.require_cap_evolve
+
+
+@pytest.fixture(autouse=True)
+def _offline_cap_evolve(tmp_path_factory, monkeypatch):
+    """No test reaches the network or the user's plugin data dir: the managed
+    skills tree is a local stub, and the install check is a no-op except in
+    the tests that exercise it directly (CI installs .[all,test], which does
+    not include the cap-evolve-core extra)."""
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path_factory.mktemp("plugin-data")))
+    monkeypatch.delenv("CAPEVOLVE_SKILLS_DIR", raising=False)
+
+    def stub_fetch(sha, dest):
+        (dest / "skills" / "_registry").mkdir(parents=True)
+        (dest / "skills" / "_registry" / "manifest.json").write_text("{}", encoding="utf-8")
+        if _LOCAL_CAPEVOLVE_TEMPLATES is not None:
+            shutil.copytree(_LOCAL_CAPEVOLVE_TEMPLATES, dest / "templates" / "project")
+        (dest / capevolve._SHA_STAMP).write_text(sha + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(capevolve, "_fetch_tree", stub_fetch)
+    monkeypatch.setattr(capevolve, "require_cap_evolve", lambda: None)
+
 
 def _init_git_repo(path: Path) -> None:
     for args in (["init", "-q"], ["config", "user.email", "test@example.com"],
@@ -1208,8 +1235,8 @@ def test_cli_dry_run_scaffolds_checks_and_estimates(tmp_path, monkeypatch, capsy
     assert result["estimate"]["spec_path"] == result["scaffold"]["spec_path"]
 
 
-@pytest.mark.skipif(importlib.util.find_spec("cap_evolve") is None,
-                    reason="requires the optional cap-evolve-core extra")
+@pytest.mark.skipif(importlib.util.find_spec("cap_evolve") is None or _LOCAL_CAPEVOLVE_TEMPLATES is None,
+                    reason="requires the optional cap-evolve-core extra and its templates/project")
 def test_cli_dry_run_intakes_a_bare_benchmark_end_to_end(tmp_path, monkeypatch, capsys):
     """The full flow on an unmodified benchmark: intake -> scaffold from
     cap-evolve's own templates -> `cap-evolve check` green -> estimate."""
@@ -1788,3 +1815,339 @@ def test_apply_winner_returns_to_a_detached_head(tmp_path):
     assert _current_branch(project_root) == "HEAD"
     assert subprocess.run(["git", "rev-parse", "HEAD"], cwd=project_root, capture_output=True,
                           text=True, check=True).stdout.strip() == sha
+
+
+# ── cap-evolve install: pinned package + matching skills tree ────────────────
+
+def _skills_tree(root: Path) -> Path:
+    (root / "skills" / "_registry").mkdir(parents=True)
+    (root / "skills" / "_registry" / "manifest.json").write_text("{}", encoding="utf-8")
+    return root / "skills"
+
+
+def test_pinned_sha_is_the_optimize_extras_commit():
+    sha = capevolve.pinned_sha()
+    assert len(sha) == 40
+    assert f"cap-evolve.git@{sha}" in (capevolve._HARNESS_ROOT / "pyproject.toml").read_text()
+
+
+def test_managed_tree_is_fetched_once_then_reused(monkeypatch):
+    calls = []
+    stub = capevolve._fetch_tree
+    monkeypatch.setattr(capevolve, "_fetch_tree", lambda sha, dest: (calls.append(sha), stub(sha, dest)))
+
+    first = capevolve.resolve_skills_dir()
+    second = capevolve.resolve_skills_dir()
+
+    sha = capevolve.pinned_sha()
+    assert first["source"] == "managed" and first["fetched"] is True
+    assert second["fetched"] is False and second["skills_dir"] == first["skills_dir"]
+    assert Path(first["skills_dir"]) == Path(os.environ["CLAUDE_PLUGIN_DATA"]) / "cap-evolve" / sha / "skills"
+    assert calls == [sha]
+
+
+def test_a_pin_bump_fetches_a_separate_tree(tmp_path):
+    harness = tmp_path / "harness"
+    harness.mkdir()
+    bumped = "b" * 40
+    (harness / "pyproject.toml").write_text(
+        f'optimize = ["cap-evolve-core @ git+https://github.com/skillberry-ai/cap-evolve.git@{bumped}#subdirectory=core"]\n',
+        encoding="utf-8")
+
+    current = capevolve.resolve_skills_dir()
+    after_bump = capevolve.resolve_skills_dir(harness_root=harness)
+
+    assert after_bump["fetched"] is True and after_bump["pinned_sha"] == bumped
+    assert after_bump["skills_dir"] != current["skills_dir"]
+
+
+def test_an_interrupted_fetch_is_redone(monkeypatch):
+    sha = capevolve.pinned_sha()
+    partial = Path(os.environ["CLAUDE_PLUGIN_DATA"]) / "cap-evolve" / sha
+    (partial / "skills" / "phases").mkdir(parents=True)  # no _registry: never finished
+
+    result = capevolve.resolve_skills_dir()
+
+    assert result["fetched"] is True
+    assert (partial / "skills" / "_registry" / "manifest.json").is_file()
+
+
+def test_unfetched_tree_without_fetch_is_a_setup_step():
+    with pytest.raises(capevolve.SetupRequired, match="not been fetched"):
+        capevolve.resolve_skills_dir(fetch=False)
+
+
+def test_override_at_the_pin_is_used(tmp_path):
+    skills = _skills_tree(tmp_path / "checkout")
+    (skills.parent / capevolve._SHA_STAMP).write_text(capevolve.pinned_sha(), encoding="utf-8")
+
+    result = capevolve.resolve_skills_dir(str(skills))
+
+    assert result == {"skills_dir": str(skills.resolve()), "source": "override",
+                      "pinned_sha": capevolve.pinned_sha(), "fetched": False, "warnings": []}
+
+
+def test_override_checkout_at_another_commit_is_rejected(tmp_path):
+    """The drift a demo hit: a cap-evolve checkout on main next to the pinned
+    cap-evolve-core package."""
+    checkout = tmp_path / "cap-evolve"
+    skills = _skills_tree(checkout)
+    _init_git_repo(checkout)
+    _git_commit_all(checkout, "main")
+
+    with pytest.raises(ValueError, match=f"git checkout {capevolve.pinned_sha()[:12]}"):
+        capevolve.resolve_skills_dir(str(skills))
+
+
+def test_override_that_is_not_a_skills_tree_is_rejected(tmp_path):
+    """A folder named cap-evolve holding only design docs is not a checkout."""
+    docs = tmp_path / "cap-evolve"
+    docs.mkdir()
+    (docs / "integration.docx").write_bytes(b"doc")
+
+    with pytest.raises(ValueError, match="not a cap-evolve skills tree"):
+        capevolve.resolve_skills_dir(str(docs))
+
+
+def test_unverifiable_override_is_used_with_a_warning(tmp_path):
+    skills = _skills_tree(tmp_path / "copy")  # no stamp, not a git checkout
+
+    result = capevolve.resolve_skills_dir(str(skills))
+
+    assert result["source"] == "override"
+    assert "could not verify" in result["warnings"][0]
+
+
+def _tarball(path: Path, sha: str, members: dict) -> Path:
+    import io
+    import tarfile
+    with tarfile.open(path, "w:gz") as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(f"cap-evolve-{sha}/{name}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return path
+
+
+def test_fetch_keeps_only_skills_and_templates(tmp_path, monkeypatch):
+    sha = "c" * 40
+    archive = _tarball(tmp_path / "src.tar.gz", sha, {
+        "skills/_registry/manifest.json": b"{}",
+        "skills/phases/run.md": b"phase",
+        "templates/project/capevolve.yaml": b"spec",
+        "core/cap_evolve/cli.py": b"code",
+        "README.md": b"readme",
+    })
+    monkeypatch.setattr(capevolve.urllib.request, "urlopen", lambda url, timeout: open(archive, "rb"))
+    dest = tmp_path / "data" / sha
+
+    _REAL_FETCH_TREE(sha, dest)
+
+    assert sorted(p.name for p in dest.iterdir()) == [capevolve._SHA_STAMP, "skills", "templates"]
+    assert (dest / "skills/phases/run.md").read_text() == "phase"
+    assert (dest / capevolve._SHA_STAMP).read_text().strip() == sha
+    assert [p.name for p in dest.parent.iterdir()] == [sha]  # no staging dir left behind
+
+
+def test_fetch_refuses_a_member_escaping_the_tree(tmp_path, monkeypatch):
+    sha = "d" * 40
+    archive = _tarball(tmp_path / "src.tar.gz", sha, {
+        "skills/_registry/manifest.json": b"{}",
+        "skills/../../../escaped.txt": b"x",
+    })
+    monkeypatch.setattr(capevolve.urllib.request, "urlopen", lambda url, timeout: open(archive, "rb"))
+    dest = tmp_path / "data" / sha
+
+    with pytest.raises(Exception):
+        _REAL_FETCH_TREE(sha, dest)
+    assert not dest.exists()
+    assert not list(tmp_path.rglob("escaped.txt"))
+
+
+def test_fetch_without_network_names_the_offline_fix(tmp_path, monkeypatch):
+    def offline(url, timeout):
+        raise OSError("network unreachable")
+    monkeypatch.setattr(capevolve.urllib.request, "urlopen", offline)
+
+    with pytest.raises(RuntimeError, match="--skills-dir"):
+        _REAL_FETCH_TREE("e" * 40, tmp_path / "data" / ("e" * 40))
+
+
+def test_missing_cap_evolve_core_is_a_setup_step(monkeypatch):
+    monkeypatch.setattr(capevolve.importlib.util, "find_spec", lambda name: None)
+    with pytest.raises(capevolve.SetupRequired, match="cap-evolve-core is not installed"):
+        _REAL_REQUIRE_CAP_EVOLVE()
+
+
+def test_an_old_venv_python_is_a_setup_step(monkeypatch):
+    monkeypatch.setattr(capevolve.sys, "version_info", (3, 10, 16))
+    with pytest.raises(capevolve.SetupRequired, match="3.10"):
+        _REAL_REQUIRE_CAP_EVOLVE()
+
+
+def test_cli_reports_setup_required_as_json_before_intake(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _bare_benchmark(tmp_path)
+
+    def missing():
+        raise capevolve.SetupRequired("cap-evolve-core is not installed in the harness venv")
+    monkeypatch.setattr(capevolve, "require_cap_evolve", missing)
+
+    exit_code = capevolve.main(["--max-usd", "5", "--dry-run"])
+
+    assert exit_code == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "setup_required",
+        "reason": "cap-evolve-core is not installed in the harness venv",
+        "fix": "/eval-setup --optimize",
+    }
+    assert not (tmp_path / ".capevolve").exists()
+
+
+def test_cli_setup_fetches_the_tree(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    assert capevolve.main(["--setup"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["source"] == "managed" and result["fetched"] is True
+    assert result["pinned_sha"] == capevolve.pinned_sha()
+
+
+def test_cap_evolve_children_get_the_resolved_skills_dir(tmp_path):
+    env = capevolve._child_env(tmp_path, "/data/cap-evolve/sha/skills")
+    assert env["CAPEVOLVE_SKILLS_DIR"] == "/data/cap-evolve/sha/skills"
+
+
+# ── Dry-run model preflight + --status measurement coverage ──────────────────
+
+def test_dry_run_reports_scope_and_models(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _bare_benchmark(tmp_path)
+
+    result = capevolve.prepare_project(max_usd=5, optimizer="mock")
+
+    assert set(result["models"]) == {"skill", "subagent", "judge", "hook"}
+    assert len(result["candidate_sources"]) == len(result["candidate_components"])
+    assert isinstance(result["warnings"], list)
+
+
+def test_openrouter_model_without_a_key_is_flagged(tmp_path, monkeypatch):
+    from agent_eval.config import EvalConfig
+    _demo_eval_yaml(tmp_path)
+    config = EvalConfig.from_yaml(tmp_path / "eval.yaml")
+    config.models.skill = "openrouter:/z-ai/glm-5.3"
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+
+    models, warnings = capevolve._model_preflight(config)
+
+    assert models["skill"] == "openrouter:/z-ai/glm-5.3"
+    assert any("models.skill" in w and "OPENROUTER_API_KEY" in w for w in warnings)
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    _models, warnings = capevolve._model_preflight(config)
+    assert not any("OPENROUTER" in w for w in warnings)
+
+
+def _finished_campaign(tmp_path, final: dict) -> Path:
+    project_dir = tmp_path / ".capevolve" / "project"
+    run_dir = tmp_path / ".capevolve" / "run_1"
+    project_dir.mkdir(parents=True)
+    run_dir.mkdir()
+    (run_dir / "final.json").write_text(json.dumps(final), encoding="utf-8")
+    (project_dir / "campaign.json").write_text(json.dumps({
+        "pid": 2 ** 22 + 12345, "create_time": "gone", "run_dir": str(run_dir),
+        "log_file": str(project_dir / "campaign-1.log"),
+    }), encoding="utf-8")
+    return project_dir
+
+
+def _split_summary(n_tasks: int, n_scored: int) -> dict:
+    return {split: {"n_tasks": n_tasks, "n_scored": n_scored} for split in ("train", "val", "test")}
+
+
+def test_status_flags_a_campaign_that_measured_nothing(tmp_path):
+    """A wrong model id errors every rollout; errors are missing data, so the
+    campaign still finishes — --status must not let that pass as a result."""
+    project_dir = _finished_campaign(tmp_path, {
+        "best_id": "seed", "seed": _split_summary(1, 0), "best": _split_summary(1, 0)})
+
+    status = capevolve.read_status(project_dir)
+
+    assert status["status"] == "finished"
+    assert status["measurements"] == {"n_tasks": 6, "n_scored": 0}
+    assert "meaningless" in status["warnings"][0]
+    assert "campaign-1.log" in status["warnings"][0]
+
+
+def test_status_flags_partial_measurement(tmp_path):
+    project_dir = _finished_campaign(tmp_path, {
+        "seed": _split_summary(2, 2), "best": _split_summary(2, 1)})
+
+    status = capevolve.read_status(project_dir)
+
+    assert status["measurements"] == {"n_tasks": 12, "n_scored": 9}
+    assert status["warnings"] == [
+        "3 of 12 evaluations produced no measurement (missing data, not 0): "
+        "the gate decided on fewer cases than planned"]
+
+
+def test_status_is_quiet_when_every_evaluation_measured(tmp_path):
+    project_dir = _finished_campaign(tmp_path, {
+        "seed": _split_summary(1, 1), "best": _split_summary(1, 1)})
+
+    status = capevolve.read_status(project_dir)
+
+    assert status["measurements"] == {"n_tasks": 6, "n_scored": 6}
+    assert status["warnings"] == []
+
+
+def test_override_inside_an_unrelated_repo_is_not_misjudged(tmp_path):
+    """Skills copied into some other git repo (a dotfiles ~/.claude, say) carry
+    that repo's HEAD, which says nothing about the cap-evolve version."""
+    dotfiles = tmp_path / "dotfiles"
+    skills = _skills_tree(dotfiles / ".claude")
+    _init_git_repo(dotfiles)
+    _git_commit_all(dotfiles, "dotfiles")
+
+    result = capevolve.resolve_skills_dir(str(skills))
+
+    assert result["source"] == "override"
+    assert "could not verify" in result["warnings"][0]
+
+
+def test_override_without_git_on_path_is_unverified_not_a_crash(tmp_path, monkeypatch):
+    skills = _skills_tree(tmp_path / "checkout")
+
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+    monkeypatch.setattr(capevolve.subprocess, "run", no_git)
+
+    assert capevolve.resolve_skills_dir(str(skills))["warnings"]
+
+
+@pytest.mark.parametrize("member", [
+    {"name": "skills/link", "type": "sym", "linkname": "../../outside"},
+    {"name": "skills/abs", "type": "sym", "linkname": "/etc/passwd"},
+    {"name": "skills/fifo", "type": "fifo"},
+])
+def test_fetch_refuses_unsafe_links_and_special_files(tmp_path, monkeypatch, member):
+    import io
+    import tarfile
+    sha = "f" * 40
+    archive = tmp_path / "src.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        manifest = tarfile.TarInfo(f"cap-evolve-{sha}/skills/_registry/manifest.json")
+        manifest.size = 2
+        tar.addfile(manifest, io.BytesIO(b"{}"))
+        info = tarfile.TarInfo(f"cap-evolve-{sha}/{member['name']}")
+        info.type = {"sym": tarfile.SYMTYPE, "fifo": tarfile.FIFOTYPE}[member["type"]]
+        info.linkname = member.get("linkname", "")
+        tar.addfile(info)
+    monkeypatch.setattr(capevolve.urllib.request, "urlopen", lambda url, timeout: open(archive, "rb"))
+    dest = tmp_path / "data" / sha
+
+    with pytest.raises(RuntimeError, match="escapes|not a file"):
+        _REAL_FETCH_TREE(sha, dest)
+    assert not dest.exists()

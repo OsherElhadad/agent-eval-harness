@@ -21,11 +21,15 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 import yaml
@@ -62,6 +66,161 @@ _RUN_DIR_POLL_INTERVAL_S = 0.2
 _STEP_EVENT_KINDS = ("step", "step_indecisive", "finalize")
 _MARKER = ".agent-eval-generated.json"
 _CAPEVOLVE_EXCLUDE = ":(exclude).capevolve"
+_HARNESS_ROOT = Path(__file__).resolve().parents[2]
+
+
+# ── cap-evolve install (pinned package + matching skills tree) ──────────────
+# The [optimize] extra installs cap-evolve-core, but `cap-evolve run` also needs
+# the repo's skills/ tree (phases, algorithms, _registry) and templates/, which
+# are not on PyPI. Both halves come from the one commit pinned in pyproject.toml:
+# the tree is fetched once into the plugin data dir, keyed by that commit, so a
+# pin bump fetches a fresh copy and the two can never drift apart.
+
+_PIN_RE = re.compile(r"skillberry-ai/cap-evolve\.git@([0-9a-f]{40})")
+_TARBALL_URL = "https://codeload.github.com/skillberry-ai/cap-evolve/tar.gz/{sha}"
+_TREE_DIRS = ("skills", "templates")
+_SHA_STAMP = ".capevolve-sha"
+_MIN_PYTHON = (3, 11)
+
+
+class SetupRequired(RuntimeError):
+    """The harness venv cannot run cap-evolve yet; ``/eval-setup --optimize`` fixes it."""
+
+
+def pinned_sha(harness_root: Path = _HARNESS_ROOT) -> str:
+    match = _PIN_RE.search((harness_root / "pyproject.toml").read_text(encoding="utf-8"))
+    if not match:
+        raise RuntimeError("pyproject.toml's [optimize] extra pins no cap-evolve commit")
+    return match.group(1)
+
+
+def _data_dir() -> Path:
+    # Same location scripts/ensure_deps.py is handed by the SessionStart hook.
+    if os.environ.get("CLAUDE_PLUGIN_DATA"):
+        return Path(os.environ["CLAUDE_PLUGIN_DATA"])
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return state / "agent-eval-data"
+
+
+def require_cap_evolve() -> None:
+    if sys.version_info < _MIN_PYTHON:
+        raise SetupRequired(
+            f"the harness venv runs Python {sys.version_info[0]}.{sys.version_info[1]}; "
+            f"cap-evolve needs {_MIN_PYTHON[0]}.{_MIN_PYTHON[1]}+"
+        )
+    if importlib.util.find_spec("cap_evolve") is None:
+        raise SetupRequired("cap-evolve-core is not installed in the harness venv")
+
+
+def _tree_version(skills_dir: Path) -> str | None:
+    """The commit a skills tree came from: our fetch stamp, else its git HEAD."""
+    checkout = skills_dir.parent
+    stamp = checkout / _SHA_STAMP
+    if stamp.is_file():
+        return stamp.read_text(encoding="utf-8").strip()
+    try:
+        head = subprocess.run(["git", "rev-parse", "--show-toplevel", "HEAD"], cwd=checkout,
+                              capture_output=True, text=True)
+    except OSError:  # no git on PATH
+        return None
+    lines = head.stdout.split()
+    # Only a cap-evolve checkout's own HEAD says anything: skills copied into
+    # some other repo (a dotfiles ~/.claude, say) would report that repo's.
+    if head.returncode or len(lines) != 2 or Path(lines[0]).resolve() != checkout.resolve():
+        return None
+    return lines[1]
+
+
+def _check_member(member: tarfile.TarInfo) -> None:
+    """Refuse an archive member that would land outside the extraction root."""
+    def escapes(path: str) -> bool:
+        return path.startswith("/") or ".." in Path(path).parts
+    if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+        raise RuntimeError(f"cap-evolve archive member is not a file or directory: {member.name}")
+    if escapes(member.name):
+        raise RuntimeError(f"cap-evolve archive member escapes the tree: {member.name}")
+    if member.issym() and escapes(os.path.normpath(os.path.join(os.path.dirname(member.name), member.linkname))):
+        raise RuntimeError(f"cap-evolve archive symlink escapes the tree: {member.name}")
+    if member.islnk() and escapes(member.linkname):
+        raise RuntimeError(f"cap-evolve archive hard link escapes the tree: {member.name}")
+
+
+def _fetch_tree(sha: str, dest: Path) -> None:
+    """Download the pinned commit's tarball and keep only skills/ and templates/."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{sha[:12]}-", dir=dest.parent))
+    try:
+        archive = staging / "src.tar.gz"
+        try:
+            with urllib.request.urlopen(_TARBALL_URL.format(sha=sha), timeout=120) as response, \
+                    open(archive, "wb") as out:
+                shutil.copyfileobj(response, out)
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not download cap-evolve {sha[:12]} ({exc}); retry with network access, "
+                f"or pass --skills-dir pointing at a cap-evolve checkout at that commit"
+            ) from exc
+        tree = staging / "tree"
+        with tarfile.open(archive) as tar:
+            members = []
+            for member in tar.getmembers():
+                # GitHub wraps everything in one "<repo>-<sha>/" directory.
+                _top, _, rel = member.name.partition("/")
+                if rel.split("/", 1)[0] not in _TREE_DIRS:
+                    continue
+                member.name = rel
+                if member.islnk():
+                    member.linkname = member.linkname.partition("/")[2]
+                _check_member(member)
+                members.append(member)
+            # The "data" filter is also safe, but only exists from 3.11.4/3.12.
+            safe = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+            tar.extractall(tree, members=members, **safe)
+        if not (tree / "skills" / "_registry" / "manifest.json").is_file():
+            raise RuntimeError(f"cap-evolve {sha[:12]} has no skills/_registry/manifest.json")
+        (tree / _SHA_STAMP).write_text(sha + "\n", encoding="utf-8")
+        try:
+            tree.rename(dest)
+        except OSError:
+            if not (dest / _SHA_STAMP).is_file():  # not just a concurrent fetch winning
+                raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def resolve_skills_dir(override: str | None = None, *, fetch: bool = True,
+                       harness_root: Path = _HARNESS_ROOT) -> dict:
+    """The cap-evolve skills tree to run with, matching the pinned commit.
+
+    An explicit ``override`` (``--skills-dir`` / ``$CAPEVOLVE_SKILLS_DIR``) is
+    used only when it is at the pin; otherwise the managed copy in the plugin
+    data dir is used, fetched on first need.
+    """
+    sha = pinned_sha(harness_root)
+    if override:
+        skills_dir = Path(override).expanduser().resolve()
+        if not (skills_dir / "_registry" / "manifest.json").is_file():
+            raise ValueError(f"{skills_dir} is not a cap-evolve skills tree (no _registry/manifest.json)")
+        version = _tree_version(skills_dir)
+        if version is not None and version != sha:
+            raise ValueError(
+                f"{skills_dir} is cap-evolve {version[:12]}, but the installed cap-evolve-core is "
+                f"{sha[:12]}: run `git checkout {sha[:12]}` there, or unset --skills-dir/"
+                f"CAPEVOLVE_SKILLS_DIR to use the managed copy"
+            )
+        warnings = [] if version else [f"could not verify {skills_dir} is at the pinned commit {sha[:12]}"]
+        return {"skills_dir": str(skills_dir), "source": "override", "pinned_sha": sha,
+                "fetched": False, "warnings": warnings}
+    root = _data_dir() / "cap-evolve" / sha
+    fetched = False
+    if not (root / "skills" / "_registry" / "manifest.json").is_file():
+        if not fetch:
+            raise SetupRequired(f"cap-evolve's skills tree for {sha[:12]} has not been fetched")
+        shutil.rmtree(root, ignore_errors=True)  # a partial tree from an interrupted fetch
+        _fetch_tree(sha, root)
+        fetched = True
+    return {"skills_dir": str(root / "skills"), "source": "managed", "pinned_sha": sha,
+            "fetched": fetched, "warnings": []}
 
 
 # ── Validation (cap-evolve-specific layer over artifact.validate_candidate_block) ──
@@ -128,6 +287,37 @@ def _cap_evolve_templates(skills_dir: str | None) -> Path | None:
         if template.is_dir():
             return template
     return None
+
+
+def _model_preflight(config: EvalConfig) -> tuple[dict, list[str]]:
+    """The models every rollout will use, and cheap checks that they can be served.
+
+    A model the runner cannot serve does not fail a campaign: each rollout errors,
+    is recorded as missing data, and the campaign still "finishes" having spent
+    optimizer budget on nothing. Surface the likeliest causes before launch.
+    """
+    from agent_eval.providers.base import parse_agent_model
+
+    roles = {role: getattr(config.models, role) for role in ("skill", "subagent", "judge", "hook")}
+    warnings = []
+    if not roles["skill"]:
+        warnings.append("models.skill is unset: rollouts run on the runner's default model")
+    openrouter = getattr(config.models.providers, "openrouter", None)
+    key_envs = [getattr(openrouter, "api_key_env", None) or "OPENROUTER_API_KEY",
+                getattr(openrouter, "management_key_env", None) or "OPENROUTER_MANAGEMENT_KEY"]
+    for role, uri in roles.items():
+        try:
+            provider = parse_agent_model(uri).provider if uri else None
+        except ValueError:
+            continue  # config load already rejects a malformed id
+        if provider == "openrouter" and not any(os.environ.get(name) for name in key_envs):
+            warnings.append(
+                f"models.{role} is {uri}, but neither ${key_envs[0]} nor ${key_envs[1]} is set: "
+                f"every rollout would fail. Set the key, or override models in the "
+                f".capevolve overlay with a model this machine serves (set providers: null "
+                f"to drop the inherited OpenRouter pins)"
+            )
+    return roles, warnings
 
 
 def _skill_location(project_root: Path, config: EvalConfig, apply_to: str) -> dict:
@@ -565,6 +755,7 @@ def prepare_project(
     (project_dir / _MARKER).write_text(json.dumps({"generated_by": "agent-eval-capevolve", "version": 3}) + "\n")
 
     cost_hint = _calibrate_cost_from_past_runs(config, project_root)
+    models, model_warnings = _model_preflight(config)
     result = {
         "project_dir": str(project_dir),
         "spec_path": str(project_dir / "capevolve.yaml"),
@@ -574,6 +765,11 @@ def prepare_project(
         "defaulted": resolved["defaulted"],
         "task_count": len(case_dirs),
         "candidate_components": [item["dest"] for item in components],
+        # What the optimizer may edit vs. what it only runs alongside — the
+        # overlay's optimize.candidate list is how a user narrows the scope.
+        "candidate_sources": [os.path.relpath(item["source"], project_root) for item in components],
+        "models": models,
+        "warnings": model_warnings,
         "runtime_resources": candidate_manifest["runtime_resources"],
         "cap_evolve_templates": str(template_dir) if template_dir else None,
         "splits": {
@@ -625,19 +821,24 @@ def _calibrate_cost_from_past_runs(config: EvalConfig, project_root: Path) -> fl
 
 # ── cap-evolve subprocess dispatch (check/estimate) ─────────────────────────
 
-def _child_env(harness_root: Path) -> dict:
+def _child_env(harness_root: Path, skills_dir: str | None = None) -> dict:
     env = dict(os.environ)
     old_path = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(harness_root) + (os.pathsep + old_path if old_path else "")
     env.pop("_AGENT_EVAL_BOOTSTRAP_DONE", None)
+    if skills_dir:
+        # cap-evolve's own lookup otherwise falls back to ./.claude/skills,
+        # i.e. the benchmark's skills, not cap-evolve's.
+        env["CAPEVOLVE_SKILLS_DIR"] = skills_dir
     return env
 
 
-def _cap_evolve(args: list[str], *, cwd: Path, harness_root: Path, stream_stderr: bool = False) -> dict:
+def _cap_evolve(args: list[str], *, cwd: Path, harness_root: Path, stream_stderr: bool = False,
+                skills_dir: str | None = None) -> dict:
     proc = subprocess.run(
         [sys.executable, "-m", "cap_evolve.cli", *args],
         cwd=cwd,
-        env=_child_env(harness_root),
+        env=_child_env(harness_root, skills_dir),
         stdout=subprocess.PIPE,
         stderr=None if stream_stderr else subprocess.PIPE,
         text=True,
@@ -771,7 +972,7 @@ def launch_detached(
         proc = subprocess.Popen(
             command,
             cwd=project_root,
-            env=_child_env(harness_root),
+            env=_child_env(harness_root, skills_dir),
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -874,6 +1075,40 @@ def _count_indecisive(events_path: Path) -> int:
     return count
 
 
+def _measurement_coverage(final: dict) -> dict | None:
+    """How many of a finished campaign's planned evaluations produced a reward.
+
+    final.json carries ``n_tasks``/``n_scored`` per split for the seed and the
+    winner. An errored rollout is missing data, never 0, so a campaign whose
+    rollouts all failed still "finishes" — this is what tells the two apart.
+    """
+    tasks = scored = 0
+    for group in (final.get("seed"), final.get("best")):
+        for split in (group or {}).values() if isinstance(group, dict) else ():
+            if isinstance(split, dict) and isinstance(split.get("n_tasks"), int):
+                tasks += split["n_tasks"]
+                scored += int(split.get("n_scored") or 0)
+    return {"n_tasks": tasks, "n_scored": scored} if tasks else None
+
+
+def _coverage_warnings(coverage: dict | None, log_file: str | None) -> list[str]:
+    if coverage is None:
+        return []
+    tasks, scored = coverage["n_tasks"], coverage["n_scored"]
+    if scored == 0:
+        return [
+            f"no evaluation produced a measurement (0 of {tasks}): this result is meaningless. "
+            f"Every rollout errored before scoring (e.g. a model id the runner cannot serve, a "
+            f"missing API key, a judge failure) — see {log_file} and the opt-* run dirs"
+        ]
+    if scored < tasks:
+        return [
+            f"{tasks - scored} of {tasks} evaluations produced no measurement (missing data, "
+            f"not 0): the gate decided on fewer cases than planned"
+        ]
+    return []
+
+
 def read_status(project_dir: Path) -> dict:
     """Report progress of the campaign launched in *project_dir*, if any.
 
@@ -900,6 +1135,7 @@ def read_status(project_dir: Path) -> dict:
         status = "running"
     else:
         status = "stopped"
+    coverage = _measurement_coverage(final) if final else None
 
     return {
         "status": status,
@@ -919,6 +1155,8 @@ def read_status(project_dir: Path) -> dict:
         },
         "latest_event": latest_event,
         "final": final,
+        "measurements": coverage,
+        "warnings": _coverage_warnings(coverage, manifest.get("log_file")),
     }
 
 
@@ -1089,6 +1327,14 @@ def _cmd_apply() -> dict:
     )
 
 
+def _print_setup_required(exc: SetupRequired) -> int:
+    # A strict JSON contract on stdout: /eval-optimize runs /eval-setup
+    # --optimize for the user on this error, then retries.
+    print(json.dumps({"error": "setup_required", "reason": str(exc),
+                      "fix": "/eval-setup --optimize"}, indent=2))
+    return 2
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", help="the benchmark's eval config (default: ./eval.yaml)")
@@ -1106,7 +1352,8 @@ def main(argv=None) -> int:
                         help="Harbor environment for --runner harbor (default: podman)")
     parser.add_argument("--image", help="Harbor task image for --runner harbor")
     parser.add_argument("--skills-dir", default=os.environ.get("CAPEVOLVE_SKILLS_DIR"),
-                        help="cap-evolve skills directory (default: $CAPEVOLVE_SKILLS_DIR)")
+                        help="your own cap-evolve skills tree, at the pinned commit (default: "
+                             "$CAPEVOLVE_SKILLS_DIR, else a managed copy fetched at the pin)")
     parser.add_argument("--reintake", action="store_true",
                         help="regenerate the .capevolve eval-config overlay instead of reusing it")
     parser.add_argument("--pilot-case-ids", nargs=3, metavar=("TRAIN_ID", "VAL_ID", "TEST_ID"),
@@ -1119,13 +1366,25 @@ def main(argv=None) -> int:
     parser.add_argument("--status", action="store_true", help="report progress of the launched campaign")
     parser.add_argument("--apply", action="store_true",
                          help="apply a finished campaign's winning candidate onto a new git branch")
+    parser.add_argument("--setup", action="store_true",
+                        help="verify cap-evolve-core and fetch its pinned skills tree (run by /eval-setup --optimize)")
     args = parser.parse_args(argv)
 
-    explicit = sum([args.dry_run, args.status, args.apply])
+    explicit = sum([args.dry_run, args.status, args.apply, args.setup])
     if explicit > 1:
-        parser.error("choose exactly one of --dry-run, --status, or --apply")
+        parser.error("choose exactly one of --dry-run, --status, --apply, or --setup")
     if explicit == 1 and args.run:
-        parser.error("--run cannot be combined with --dry-run/--status/--apply")
+        parser.error("--run cannot be combined with --dry-run/--status/--apply/--setup")
+    if args.setup:
+        try:
+            require_cap_evolve()
+            print(json.dumps(resolve_skills_dir(args.skills_dir), indent=2))
+            return 0
+        except SetupRequired as exc:
+            return _print_setup_required(exc)
+        except Exception as exc:
+            print(f"agent-eval-capevolve: {exc}", file=sys.stderr)
+            return 1
     if args.dry_run:
         mode = "dry_run"
     elif args.status:
@@ -1165,6 +1424,17 @@ def main(argv=None) -> int:
         parser.error("--split-ratios must be three comma-separated numbers")
 
     try:
+        # Self-healing: a missing venv package is a setup step the agent runs
+        # for the user; a missing skills tree is fetched here, silently.
+        require_cap_evolve()
+        skills = resolve_skills_dir(args.skills_dir)
+    except SetupRequired as exc:
+        return _print_setup_required(exc)
+    except Exception as exc:
+        print(f"agent-eval-capevolve: {exc}", file=sys.stderr)
+        return 1
+
+    try:
         generated = prepare_project(
             args.config,
             max_usd=args.max_usd,
@@ -1179,17 +1449,20 @@ def main(argv=None) -> int:
             runner=args.runner,
             harbor_env=args.env,
             image=args.image,
-            skills_dir=args.skills_dir,
+            skills_dir=skills["skills_dir"],
             reintake=args.reintake,
         )
+        generated["warnings"] = skills["warnings"] + generated.get("warnings", [])
+        generated["cap_evolve_skills"] = {k: skills[k] for k in ("skills_dir", "source", "pinned_sha", "fetched")}
         project_dir = Path(generated["project_dir"])
-        harness_root = Path(__file__).resolve().parents[2]
-        checked = _cap_evolve(["check", str(project_dir)], cwd=Path.cwd(), harness_root=harness_root)
+        harness_root = _HARNESS_ROOT
+        checked = _cap_evolve(["check", str(project_dir)], cwd=Path.cwd(), harness_root=harness_root,
+                              skills_dir=skills["skills_dir"])
         if not checked.get("ok"):
             raise RuntimeError(json.dumps(checked, indent=2))
         estimate = _cap_evolve(
             ["estimate", "--project", str(project_dir), "--spec", generated["spec_path"]],
-            cwd=Path.cwd(), harness_root=harness_root,
+            cwd=Path.cwd(), harness_root=harness_root, skills_dir=skills["skills_dir"],
         )
         if mode == "dry_run":
             print(json.dumps({"scaffold": generated, "check": checked, "estimate": estimate}, indent=2))
@@ -1201,7 +1474,7 @@ def main(argv=None) -> int:
             spec_path=generated["spec_path"],
             max_usd=args.max_usd,
             max_iterations=args.max_iterations,
-            skills_dir=args.skills_dir,
+            skills_dir=skills["skills_dir"],
             harness_root=harness_root,
         )
         print(json.dumps(

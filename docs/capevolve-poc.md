@@ -62,8 +62,8 @@ skill directory, no judges, no cases, an unsupported runner) is never guessed.
 Intake writes `BLOCKED: <input> — why — how` lines to `PROJECT.md`, removes any
 stale `capevolve.yaml`, and the CLI exits 1 with `{"blocked": [...]}`.
 
-`.capevolve/project/` is cap-evolve's own `templates/project` tree (found
-next to `--skills-dir`/`$CAPEVOLVE_SKILLS_DIR` or the installed package), with
+`.capevolve/project/` is cap-evolve's own `templates/project` tree (from the
+pinned skills tree, see [Install and dry-run](#install-and-dry-run)), with
 these files generated over it:
 
 - `adapters/adapter.py` + `aeh_bridge.py` + `substrate.json` + `candidate.json`: the seam
@@ -281,22 +281,41 @@ those on the CLI instead.
 
 ## Install and dry-run
 
-Install the pinned optional engine dependency — cap-evolve **v0.2.0** (commit
-`520ecbe8b`; its `core/pyproject.toml` still reads `0.1.0`, the tag did not bump
-it) — and the cap-evolve skills tree from the same version.
-The core package alone does not include optimizer/phase skills or the project
-templates.
+In Claude Code, `/eval-setup --optimize` does everything; nothing has to be
+cloned or configured by hand. From a shell:
 
 ```bash
-python3 -m pip install -e '.[optimize]'
-export CAPEVOLVE_SKILLS_DIR=/path/to/cap-evolve/skills
+python3 -m pip install -e '.[optimize]'   # cap-evolve-core, pinned (Python 3.11+)
 cd /path/to/benchmark && agent-eval-capevolve --max-usd 20 --dry-run
 ```
+
+The `[optimize]` extra pins cap-evolve **v0.2.0** by commit (`520ecbe8b`; its
+`core/pyproject.toml` still reads `0.1.0`, the tag did not bump it). That
+package does not include cap-evolve's skills tree (optimizer/phase/algorithm
+skills, `_registry`) or its project templates, which are not on PyPI. So the
+first dry-run or launch fetches them itself: the GitHub tarball of exactly the
+pinned commit, keeping only `skills/` and `templates/` (~3 MB), into
+`<plugin data dir>/cap-evolve/<sha>/` (`$CLAUDE_PLUGIN_DATA`, else
+`~/.local/state/agent-eval-data`). The directory is keyed by commit, so bumping
+the pin fetches a fresh copy and the package and tree can never drift.
+`agent-eval-capevolve --setup` (what `/eval-setup --optimize` runs) does the
+same ahead of time. Offline, or with a checkout of your own, point
+`--skills-dir`/`$CAPEVOLVE_SKILLS_DIR` at it; it is used only if it is at the
+pinned commit, and refused otherwise with the `git checkout` that fixes it. A
+missing cap-evolve-core (or a venv older than 3.11) returns
+`{"error": "setup_required", ...}` with exit 2, which `/eval-optimize` handles
+by running `/eval-setup --optimize` and retrying.
 
 `--config` defaults to `./eval.yaml`. The command runs intake, creates
 `.capevolve/project/`, runs `cap-evolve check`, and prints
 cap-evolve's estimate plus split sizes and (when this eval has prior harness
-runs) an `observed_cost_per_rollout` figure calibrated from them. The
+runs) an `observed_cost_per_rollout` figure calibrated from them. It also
+lists `candidate_sources` (the skills the optimizer may edit — trim
+`optimize.candidate` in the overlay to narrow it), the `models` every rollout
+uses, and `warnings` for models this machine likely cannot serve (an
+`openrouter:/` model without its key). A model the runner cannot serve does not
+fail the campaign: every rollout errors, is recorded as missing data, and the
+campaign "finishes" with nothing measured. The
 generated adapter is `.capevolve/project/adapters/adapter.py` — a ~5-line shim
 cap-evolve's zero-arg `Adapter()` construction loads, importing from the
 adjacent, self-contained `aeh_bridge.py` (not from the harness's install
@@ -352,6 +371,12 @@ indecisive}` breakdown — counted from cap-evolve's own `history.jsonl`/
 `rejected.jsonl`/`events.jsonl` (there's no single field carrying this; a line
 in `history.jsonl` means accepted, a line in `rejected.jsonl` means rejected,
 and indecisive candidates appear only as a `step_indecisive` event).
+
+Once finished, `measurements: {n_tasks, n_scored}` counts the planned
+evaluations of the seed and winner (from `final.json`) against those that
+produced a reward, and `warnings` flags any shortfall. `n_scored: 0` means
+every rollout errored and the result is meaningless, even though the
+campaign finished normally.
 
 ## Apply the winner
 

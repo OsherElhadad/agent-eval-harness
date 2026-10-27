@@ -26,9 +26,13 @@ current scope limits (local or Harbor substrate; EvalHub is refused). Do not pro
 `python3 ${CLAUDE_SKILL_DIR}/scripts/capevolve.py <flags>`, run from the
 benchmark's root (`--config` defaults to the benchmark's eval config).
 
-If `--skills-dir` wasn't given, check `tmp/optimize-config.yaml` for a
-`capevolve_skills_dir` value (written by `/eval-setup --optimize`) and use
-that instead of asking the user again.
+Setup is self-healing — never ask the user for a cap-evolve path. The command
+fetches cap-evolve's skills tree at the pinned commit on first use. If any mode
+returns `{"error": "setup_required", ...}` (exit 2), the venv lacks
+cap-evolve-core: tell the user in one line, invoke `/eval-setup --optimize`
+with the Skill tool, then re-run the same command. Pass `--skills-dir` only if
+the user names their own checkout; a checkout at another commit is refused with
+the `git checkout` that fixes it.
 
 - **`--dry-run`**: run it. The command performs cap-evolve's intake phase
   itself and never edits the benchmark: missing `optimize:`/`reward:` blocks
@@ -42,7 +46,13 @@ that instead of asking the user again.
   pass/fail gate) without asking whether to change them. Edit the overlay only
   if the user asks to (an edited overlay is reused; `--reintake` regenerates
   it), then re-run `--dry-run`. Then narrate the
-  result — don't just print the JSON: state the train/val/test split sizes, the gate
+  result — don't just print the JSON. Lead with what will be optimized and
+  how: `scaffold.candidate_sources` are the skills the optimizer may edit
+  (everything else only runs alongside; trimming `optimize.candidate` in the
+  overlay narrows it) and `scaffold.models` the models every rollout uses.
+  Quote each `scaffold.warnings` entry and resolve it with the user before any
+  launch — a model this machine cannot serve does not fail the campaign, it
+  errors every rollout and spends the budget on nothing. Then state the train/val/test split sizes, the gate
   mode and `k_se`, the qualitative point that smaller real gains come back
   "indecisive" rather than "accept" at small val sizes, and the cost estimate
   as a **range**, blended with `observed_cost_per_rollout` when the response
@@ -59,15 +69,20 @@ that instead of asking the user again.
   detached from this one) to check progress and `--apply` once it finishes.
 - **`--status`**: run it, then interpret the result in prose rather than
   printing raw JSON: report `status` plainly (not launched / running /
-  finished / stopped — if stopped, say to check `log_file`), the
+  finished / stopped — if stopped, say to check `log_file`). If `warnings`
+  is non-empty, quote it first: a finished campaign with
+  `measurements.n_scored: 0` produced no result at all, so do not summarize a
+  winner or suggest `--apply` — find the rollout error in `log_file` or an
+  `opt-*` run dir instead. Otherwise report the
   accepted/rejected/indecisive iteration counts, spend vs. budget, and an
   honest caveat on the error bars (the `spent`/`budget` figures carry no
   variance info by themselves, and gains near the gate's resolution are
   uncertain). If `final` is present, also summarize what the winning
   candidate changed: `git diff` the seed capability
   (`.capevolve/project/seed_capability/`) against
-  `<run_dir>/candidates/<best_id>/` and describe the change in a sentence or
-  two, grounded in the diff, not invented.
+  `<run_dir>/candidates/<best_id>/` with `git diff --no-index` (both are
+  untracked) and describe the change in a sentence or two, grounded in the
+  diff, not invented.
 - **`--apply`**: run it, report the branch name and changed files, then
   surface the response's `caveat` and `suggested_next_step` verbatim as the
   closing guidance — this is the doc's optimistic-bias warning (the sealed

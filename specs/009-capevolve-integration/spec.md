@@ -207,8 +207,7 @@ git branch, and leaves the user's current branch/working tree untouched.
 Scaffold and check readiness without spending anything:
 
 ```bash
-python3 -m pip install -e '.[optimize]'
-export CAPEVOLVE_SKILLS_DIR=/path/to/cap-evolve/skills
+python3 -m pip install -e '.[optimize]'   # cap-evolve's skills tree is fetched at the pin on first use
 cd rfe-creator && agent-eval-capevolve --max-usd 20 --dry-run
 ```
 
