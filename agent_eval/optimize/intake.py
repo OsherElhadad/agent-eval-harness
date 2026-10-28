@@ -259,14 +259,21 @@ def runtime_resources(project_root: Path, config: EvalConfig, components: list[d
         name = _top_level_name(path, root)
         if name:
             excluded.add(name)
+    # A real /eval-run workspace also links a project's own execution.symlinks
+    # entries (spec, workspace.py:_resolve_symlink_names) on top of the
+    # defaults. Without reading them here too, a benchmark that declares one
+    # would get it in a normal run but silently miss it from every
+    # optimization rollout — no error, just a possibly-wrong result against
+    # an incomplete workspace.
+    default_resources = (*DEFAULT_RUNTIME_RESOURCES, *(getattr(config.execution, "symlinks", None) or []))
     entries = {
         p.name: p for p in sorted(root.iterdir())
-        if p.name not in excluded and p.name in DEFAULT_RUNTIME_RESOURCES
+        if p.name not in excluded and p.name in default_resources
         or (p.is_dir() and not p.is_symlink() and not p.name.startswith(".")
             and p.name not in excluded)
     }
 
-    included = [name for name in DEFAULT_RUNTIME_RESOURCES if name in entries]
+    included = [name for name in default_resources if name in entries]
     sources = [Path(c["source"]) for c in components]
     settings = root / ".claude" / "settings.json"
     if settings.is_file():
