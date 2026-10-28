@@ -479,6 +479,25 @@ def test_local_rollout_writes_the_standard_report_and_tolerates_its_failure(tmp_
     assert result["rollout"]["metadata"]["reward"] == 1.0
 
 
+def test_run_script_times_out_instead_of_hanging_forever(tmp_path, monkeypatch):
+    """The local substrate had no cap at all (unlike Harbor's --agent-timeout,
+    rollout.py:442): a hung step (network stall, runaway agent loop) blocked
+    the whole campaign forever, since max_usd never gets the chance to
+    trigger if nothing returns."""
+    script = tmp_path / "skills" / "eval-run" / "scripts" / "execute.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("", encoding="utf-8")
+    manifest = {"harness_root": str(tmp_path), "project_root": str(tmp_path), "agent_timeout_s": 10}
+
+    def _fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"), output=b"", stderr=b"stuck on tool call")
+
+    monkeypatch.setattr(rollout.subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="timed out after 310s"):
+        rollout._run_script(manifest, "execute.py", "--output", str(tmp_path))
+
+
 # ── agent_eval.engines.capevolve: scaffolding ────────────────────────────────
 
 def test_prepare_project_generates_adapter_seed_and_search_spec(tmp_path, monkeypatch):
@@ -540,11 +559,20 @@ optimize:
     assert manifest["runner_budget_usd"] == 0.5
     assert manifest["apply_to"] == ".claude/skills/demo"
     assert manifest["base_eval_config"] == str(tmp_path / "eval.yaml")
+    # The eval config's path must not leak into PROJECT.md: it can hold judge
+    # prompts/rubrics with gold content, and PROJECT.md lives inside the
+    # directory the optimizer reads and edits every iteration.
+    assert manifest["base_eval_config"] not in (project / "PROJECT.md").read_text()
     # The eval config already declares optimize: and reward: -> no overlay.
     assert result["overlay"] is None
     assert not intake.overlay_path(tmp_path).exists()
     assert substrate["runner"] == "local"
-    assert substrate["harness_python"] == sys.executable
+    # The venv's own interpreter when one exists (it must be able to import
+    # cap_evolve, which sys.executable is not guaranteed to), else a safe
+    # fallback to sys.executable (no venv to speak of).
+    assert substrate["harness_python"] == capevolve._venv_python(
+        Path(capevolve.__file__).resolve().parents[2]
+    )
     assert "dataset_source: adapter" in spec
     assert "gate_k_se: 1.0" in spec
     assert "max_usd: 5" in spec
@@ -1026,8 +1054,9 @@ def test_prepare_project_records_the_harbor_substrate(tmp_path, monkeypatch):
 
     project = Path(result["project_dir"])
     substrate = json.loads((project / "adapters/substrate.json").read_text())
+    expected_python = capevolve._venv_python(Path(capevolve.__file__).resolve().parents[2])
     assert substrate == {"runner": "harbor", "env": "podman", "image": "localhost/aeh:latest",
-                         "harness_python": sys.executable}
+                         "harness_python": expected_python}
     assert "on Harbor (`--env podman`" in (project / "PROJECT.md").read_text()
 
 
@@ -1051,6 +1080,33 @@ def test_intake_runtime_resources_follow_code_paths_and_skip_measurement(tmp_pat
     # the dataset (gold), eval profiles (judges), tests and unreferenced
     # docs never reach the agent's workspace.
     assert resources == ["scripts", "types"]
+
+
+def test_intake_runtime_resources_honors_execution_symlinks(tmp_path, monkeypatch):
+    """A normal /eval-run links a project's own execution.symlinks entries on
+    top of the harness defaults (workspace.py:_resolve_symlink_names, main
+    #271). Before this fix, intake.runtime_resources only ever knew about the
+    hardcoded DEFAULT_RUNTIME_RESOURCES tuple, so an eval config declaring
+    execution.symlinks got that extra entry in a plain run but silently
+    missing from every optimization rollout workspace — no error, just a
+    possibly-wrong result against an incomplete workspace."""
+    monkeypatch.chdir(tmp_path)
+    _bare_benchmark(tmp_path)
+    (tmp_path / "project_templates").mkdir()
+    (tmp_path / "project_templates" / "notes.md").write_text("extra", encoding="utf-8")
+    (tmp_path / "eval.yaml").write_text(
+        (tmp_path / "eval.yaml").read_text(encoding="utf-8").replace(
+            "execution:\n  mode:", "execution:\n  symlinks: [project_templates]\n  mode:"
+        ),
+        encoding="utf-8",
+    )
+    from agent_eval.config import EvalConfig
+    config = EvalConfig.from_yaml("eval.yaml")
+    components = [{"source": str(tmp_path / ".claude/skills/pipeline")}]
+
+    resources = intake.runtime_resources(tmp_path, config, components)
+
+    assert "project_templates" in resources
 
 
 def test_intake_never_ships_a_harness_reserved_workspace_name(tmp_path, monkeypatch):
@@ -1817,6 +1873,48 @@ def test_apply_winner_returns_to_a_detached_head(tmp_path):
                           text=True, check=True).stdout.strip() == sha
 
 
+def test_apply_winner_deletes_its_branch_on_a_mid_apply_failure_so_retry_works(tmp_path):
+    """Before this fix, `checkout -b` ran before the try/finally, so a
+    failed apply left the branch behind; a retry then died at `checkout -b`
+    with an opaque "branch already exists" CalledProcessError."""
+    project_root, harness_manifest, campaign_manifest, skill_path = _apply_fixture(tmp_path)
+    original_branch = _current_branch(project_root)
+    harness_manifest["candidate"].append(
+        {"dest": "references/missing.md", "source": str(project_root / "skills/demo/references/missing.md"),
+         "is_dir": False}
+    )
+
+    with pytest.raises(RuntimeError, match="missing component"):
+        capevolve.apply_winner(
+            project_root=project_root,
+            harness_manifest=harness_manifest, campaign_manifest=campaign_manifest,
+        )
+
+    branches = subprocess.run(["git", "branch", "--list", "capevolve/*"], cwd=project_root,
+                              capture_output=True, text=True, check=True).stdout.strip()
+    assert branches == ""
+    assert _current_branch(project_root) == original_branch
+
+
+def test_apply_winner_ignores_the_configured_runs_dir_when_checking_dirty(tmp_path, monkeypatch):
+    """AGENT_EVAL_RUNS_DIR (default eval/runs) is populated by every rollout
+    the campaign itself runs — a benchmark that doesn't gitignore it must
+    not have --apply refuse as "not clean" over the campaign's own byproduct."""
+    project_root, harness_manifest, campaign_manifest, skill_path = _apply_fixture(
+        tmp_path, winning_skill_content="improved skill"
+    )
+    runs_dir = project_root / "eval" / "runs" / "some-eval" / "opt-1"
+    runs_dir.mkdir(parents=True)
+    (runs_dir / "run_result.json").write_text("{}", encoding="utf-8")
+
+    result = capevolve.apply_winner(
+        project_root=project_root,
+        harness_manifest=harness_manifest, campaign_manifest=campaign_manifest,
+    )
+
+    assert result["best_id"] == "cand_1"
+
+
 # ── cap-evolve install: pinned package + matching skills tree ────────────────
 
 def _skills_tree(root: Path) -> Path:
@@ -2012,6 +2110,96 @@ def test_cli_setup_fetches_the_tree(tmp_path, monkeypatch, capsys):
 
     assert result["source"] == "managed" and result["fetched"] is True
     assert result["pinned_sha"] == capevolve.pinned_sha()
+
+
+def test_venv_python_prefers_the_venv_interpreter_over_sys_executable(tmp_path, monkeypatch):
+    """sys.executable is wrong for a subprocess: agent_eval._bootstrap only
+    patches THIS process's sys.path (the common case, same major.minor as
+    the venv) and never repoints sys.executable, so a child spawned with
+    sys.executable cannot import cap_evolve even though the venv has it.
+    Regression test for the "cap-evolve returned empty stdout" failure that
+    resulted: see PR review for the live repro."""
+    v = sys.version_info
+    venv_bin = tmp_path / ".eval-venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python3"
+    venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    site_packages = tmp_path / ".eval-venv" / "lib" / f"python{v.major}.{v.minor}" / "site-packages"
+    site_packages.mkdir(parents=True)
+
+    resolved = capevolve._venv_python(tmp_path)
+
+    assert resolved == str(venv_python)
+    assert resolved != sys.executable
+
+
+def test_venv_python_falls_back_to_sys_executable_without_a_venv(tmp_path):
+    assert capevolve._venv_python(tmp_path) == sys.executable
+
+
+def test_cap_evolve_empty_stdout_error_includes_the_real_stderr(tmp_path, monkeypatch):
+    """stderr is the only place a child crash (e.g. an import error) shows
+    up; before this fix it was captured and silently discarded, so a user
+    saw only "cap-evolve returned empty stdout" with no way to diagnose it."""
+    monkeypatch.setattr(
+        capevolve.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0] if a else [], 1, stdout="",
+                                                     stderr="ModuleNotFoundError: no module named 'cap_evolve'"),
+    )
+    with pytest.raises(RuntimeError, match="ModuleNotFoundError"):
+        capevolve._cap_evolve(["check"], cwd=tmp_path, harness_root=tmp_path)
+
+
+def test_cap_evolve_nonzero_exit_error_includes_stderr_alongside_stdout(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        capevolve.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0] if a else [], 1, stdout='{"ok": false}',
+                                                     stderr="Traceback: boom"),
+    )
+    with pytest.raises(RuntimeError, match="Traceback: boom"):
+        capevolve._cap_evolve(["check"], cwd=tmp_path, harness_root=tmp_path)
+
+
+def test_launch_stop_hint_signals_the_whole_process_group(tmp_path, monkeypatch):
+    """proc.pid is also the process group id (start_new_session=True), so
+    the hint must be `kill -- -<pid>`, not plain `kill <pid>` — the latter
+    orphans every rollout/claude child still in that group."""
+    project_dir = tmp_path / ".capevolve" / "project"
+    project_dir.mkdir(parents=True)
+    run_dir = project_dir.parent / "run_20260101_000000"
+    run_dir.mkdir()
+
+    class _FakeProc:
+        pid = 12345
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(capevolve.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(capevolve, "_wait_for_new_run_dir", lambda *a, **k: run_dir)
+    monkeypatch.setattr(capevolve, "_process_create_time", lambda pid: "123")
+
+    manifest = capevolve.launch_detached(
+        project_root=tmp_path, project_dir=project_dir, spec_path="capevolve.yaml",
+        max_usd=5, max_iterations=1, skills_dir=None, harness_root=tmp_path,
+    )
+
+    assert manifest["stop_hint"] == "kill -- -12345"
+
+
+def test_stop_campaign_kills_the_process_group_not_just_the_leader(tmp_path, monkeypatch):
+    project_dir = tmp_path / ".capevolve" / "project"
+    project_dir.mkdir(parents=True)
+    capevolve._write_campaign_manifest(project_dir, {
+        "pid": 999, "create_time": "123", "run_dir": str(tmp_path / "run_x"),
+    })
+    monkeypatch.setattr(capevolve, "_is_alive", lambda pid, ct: True)
+    killed = {}
+    monkeypatch.setattr(capevolve.os, "killpg", lambda pid, sig: killed.update(pid=pid, sig=sig))
+
+    result = capevolve.stop_campaign(project_dir)
+
+    assert killed == {"pid": 999, "sig": capevolve.signal.SIGTERM}
+    assert result["status"] == "stopped"
 
 
 def test_cap_evolve_children_get_the_resolved_skills_dir(tmp_path):
