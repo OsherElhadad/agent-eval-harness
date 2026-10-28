@@ -21,6 +21,20 @@ unchanged, and every iteration's subagent transcripts copied into
 ``<workspace>/subagents/``. ``agent-result.json`` and the other files under
 ``iteration-N/output/`` are fullsend's own export and are not read.
 
+fullsend's own console (stdout, then stderr) is ``RunResult.stderr``, read
+from both pipes concurrently. With a log prefix (the harness sets one when it
+logs progress) a filtered subset of it is also streamed live, line by line,
+under the same ``  <prefix> | `` the claude-code runner uses: the section and
+step lines (``→``, ``•``, ``✓``, ``✗``, ``!``) with the indented detail lines
+attached to them (the plan block, the ``→ Results`` block), the agent activity
+lines (``💬`` text, ``⚙`` tool call, ``⏳`` heartbeat), plain
+``Error``/``Warning``/``fatal`` lines and Claude Code's ``Ignoring N
+permissions.allow entries`` line, each cut at :data:`_MAX_STREAM_LINE_CHARS`
+with ``…token=``/``…secret=``/``…password=``/``…api_key=`` assignments
+redacted. The per-finding ``! Sanitized […]`` lines, the assistant's thinking
+(``🧠``) and multi-line text and the pre/post-script output are not forwarded;
+the captured console keeps all of it, unredacted. See :class:`_ConsoleFilter`.
+
 :meth:`FullsendRunner.provenance` records what executed a run (fullsend and
 OpenShell versions, sandbox image, agent harness commit) for the run-level
 ``run_result.json``; every field fails soft to ``None`` with a warning.
@@ -85,6 +99,35 @@ _ARCH_LINE_RE = re.compile(
     r"^\W*(?:Sandbox\s+)?Arch(?:itecture)?:\s*" + _ARCH_VALUES + r"\b", re.IGNORECASE)
 _ARCH_TOKEN_RE = re.compile(r"\b" + _ARCH_VALUES + r"\b")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+
+# Live console streaming (``log_prefix`` set). Forwarded lines are cut here so
+# a long batch stays well inside a CI job log's output limit.
+_MAX_STREAM_LINE_CHARS = 200
+# Seconds to wait for the pipes to reach EOF once the process group is down
+# (a descendant that inherited a pipe may outlive fullsend).
+_PIPE_DRAIN_S = 5.0
+# Console line shapes as fullsend 0.51 prints them (an optional U+FE0F after
+# the marker is tolerated).
+# Sections at column 0 (``→ Results``, the ``⚡ fullsend <version>`` banner);
+# steps and agent activity indented by two spaces; a section or step may be
+# followed by detail lines indented by four (the plan block, results, paths).
+_SECTION_LINE_RE = re.compile(r"^(?:→|->|⚡)\ufe0f?(?:\s|$)")
+_STEP_LINE_RE = re.compile(r"^ {2,}[•✓✗!]\ufe0f?(?:\s|$)")
+# Agent activity: assistant text, tool call, heartbeat. Thinking (``🧠``) is
+# not forwarded, as the claude-code runner never streams it.
+_ACTIVITY_LINE_RE = re.compile(r"^ {2,}[💬⚙⏳]\ufe0f?(?:\s|$)")
+_SANITIZED_LINE_RE = re.compile(r"^ {2,}!\s+Sanitized\s*\[")
+# Plain alerts, and Claude Code's note that it dropped the workspace's
+# permissions.allow entries (the line behind the eval permission denials).
+_ALERT_LINE_RE = re.compile(
+    r"^\s*(?:(?:error|warning|fatal)\b|ignoring \d+ permissions)", re.IGNORECASE)
+# A ``KEY=value`` whose key names a credential, as a ``⚙ Bash:`` line may carry
+# one: the value is replaced before the line is forwarded (fullsend caps the
+# command at 120 runes but does not redact it). The capture is left as is.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(\w*(?:token|secret|passw(?:or)?d|api[_-]?key)\w*=)"
+    r"(?:\"[^\"]*\"|'[^']*'|\S+)")
+_DETAIL_INDENT = " " * 4
 
 
 class FullsendRunner(EvalRunner):
@@ -393,6 +436,9 @@ class FullsendRunner(EvalRunner):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # A byte the console cannot decode becomes U+FFFD in the capture
+            # instead of raising out of the reader thread (and the case).
+            errors="replace",
             cwd=str(workspace),
             env=env,
         )
@@ -402,23 +448,39 @@ class FullsendRunner(EvalRunner):
             proc = subprocess.Popen(cmd, **popen_kwargs)
         except (OSError, subprocess.SubprocessError) as e:
             return -1, "", str(e), time.monotonic() - start
+        # Both pipes are read as they fill (neither can block fullsend) and,
+        # with a log prefix, forwarded live; the readers own the pipes from
+        # here on, so the teardown below only reaps.
+        console = _ConsoleCapture(proc, self._log_prefix)
         try:
-            out, err = proc.communicate(timeout=timeout_s)
+            # The contract of communicate(timeout): both pipes at EOF and the
+            # process exited within the timeout, otherwise TimeoutExpired with
+            # the leader still unreaped.
+            if not console.join(timeout_s):
+                raise subprocess.TimeoutExpired(cmd, timeout_s)
+            proc.wait(timeout=max(0.0, start + timeout_s - time.monotonic()))
         except subprocess.TimeoutExpired:
             # SIGTERM lets fullsend tear its sandbox down; the group is killed
             # only while the leader is still unreaped (see base.py).
-            out, err = terminate_process_group(proc, self._term_grace_s)
+            _, hung = terminate_process_group(
+                proc, self._term_grace_s, capture_output=False)
+            if not console.join(_PIPE_DRAIN_S):
+                # A descendant outside the group still holds a pipe (what
+                # communicate(timeout) reported as the termination hanging):
+                # the console may be cut short and its reader is still up.
+                hung = hung or "Console pipes still open after the group kill"
             # Exit code -1 with a "Timed out" stderr; the caller still maps
             # whatever the run directory holds (usage, stream, artifacts).
             timeout_err = "\n".join(
-                s for s in (f"Timed out after {timeout_s}s", out, err) if s)
+                s for s in (f"Timed out after {timeout_s}s", console.stdout,
+                            console.stderr, hung) if s)
             return -1, "", timeout_err, time.monotonic() - start
         except BaseException:
             # fullsend runs in its own session, so the terminal's SIGINT never
             # reaches it: stop the group (and its sandbox) before re-raising.
-            terminate_process_group(proc, self._term_grace_s)
+            terminate_process_group(proc, self._term_grace_s, capture_output=False)
             raise
-        return proc.returncode, out or "", err or "", time.monotonic() - start
+        return proc.returncode, console.stdout, console.stderr, time.monotonic() - start
 
     # ── Run directory → RunResult ────────────────────────────────────
 
@@ -508,6 +570,126 @@ class FullsendRunner(EvalRunner):
             raw_output=raw_output,
             message_ids=message_ids,
         )
+
+
+# ── Console capture and live streaming ───────────────────────────────
+
+class _ConsoleCapture:
+    """fullsend's stdout and stderr, read concurrently.
+
+    One daemon thread per pipe keeps every line — the text is what
+    ``communicate`` would have returned: universal newlines, in order — and,
+    given a log prefix, prints the lines :class:`_ConsoleFilter` selects under
+    ``  <prefix> | `` as they arrive. Reading both pipes at once is what keeps
+    fullsend from blocking on a full one; the threads are daemons so a
+    descendant that inherited a pipe and outlives fullsend cannot hang the
+    harness (:meth:`join` is bounded, and what was read by then is kept)."""
+
+    def __init__(self, proc: subprocess.Popen, log_prefix: Optional[str] = None):
+        self._lines: dict = {"stdout": [], "stderr": []}
+        self._threads: list = []
+        for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+            if stream is None:
+                continue
+            thread = threading.Thread(
+                target=self._pump, args=(name, stream, log_prefix),
+                name=f"fullsend-{name}", daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def _pump(self, name: str, stream, log_prefix: Optional[str]) -> None:
+        lines = self._lines[name]
+        select = _ConsoleFilter() if log_prefix else None
+        try:
+            for line in stream:
+                lines.append(line)
+                if select is None:
+                    continue
+                shown = select.select(line)
+                if shown is None:
+                    continue
+                try:
+                    with _print_lock:
+                        print(f"  {log_prefix} | {shown}", flush=True)
+                except (OSError, ValueError):
+                    # The harness's stdout is gone (closed pipe) or cannot
+                    # encode the line (a non-UTF-8 console): stop forwarding
+                    # but keep draining, or fullsend blocks on a full pipe
+                    # until the timeout. Draining never depended on printing.
+                    select = None
+        except (OSError, ValueError):
+            pass  # the pipe closed under the reader: keep what was read
+        finally:
+            try:
+                stream.close()  # at EOF, or closed under the reader
+            except OSError:
+                pass
+
+    def join(self, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for both pipes to reach EOF; ``False``
+        when one is still open."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        for thread in self._threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return not any(thread.is_alive() for thread in self._threads)
+
+    @property
+    def stdout(self) -> str:
+        return "".join(self._lines["stdout"])
+
+    @property
+    def stderr(self) -> str:
+        return "".join(self._lines["stderr"])
+
+
+class _ConsoleFilter:
+    """Picks the console lines worth forwarding live.
+
+    Forwarded: section lines (``→ …``, the ``⚡`` banner), step lines (``•``,
+    ``✓``, ``✗``, ``!``) except the per-finding ``! Sanitized […]`` ones, the
+    detail lines indented under a section or step (the plan block after
+    ``Harness loaded``, the ``→ Results`` block, an extracted path), the agent
+    activity lines (``💬`` text, ``⚙`` tool call, ``⏳`` heartbeat), plain
+    lines starting with Error/Warning/fatal and Claude Code's ``Ignoring N
+    permissions.allow entries`` line. Dropped: everything else — the
+    assistant's thinking (``🧠``) and the multi-line text after a ``💬``/``🧠``
+    line, the pre/post-script output, the sandbox's own chatter. A forwarded
+    line has credential assignments redacted and is clipped (see
+    :func:`_present`). One instance per pipe: the only state is whether a
+    detail block is open."""
+
+    def __init__(self):
+        self._in_block = False
+
+    def select(self, line: str) -> Optional[str]:
+        text = _ANSI_RE.sub("", line).rstrip()
+        if not text.strip():
+            self._in_block = False
+            return None
+        return _present(text) if self._picks(text) else None
+
+    def _picks(self, text: str) -> bool:
+        if _SECTION_LINE_RE.match(text) or (
+                _STEP_LINE_RE.match(text) and not _SANITIZED_LINE_RE.match(text)):
+            self._in_block = True
+            return True
+        if _ACTIVITY_LINE_RE.match(text):
+            # Its continuation lines are the assistant's prose, not details.
+            self._in_block = False
+            return True
+        if self._in_block and text.startswith(_DETAIL_INDENT):
+            return True
+        self._in_block = False
+        return bool(_ALERT_LINE_RE.match(text))
+
+
+def _present(text: str) -> str:
+    """A console line as forwarded: credential values redacted, then cut at
+    :data:`_MAX_STREAM_LINE_CHARS`."""
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\1***", text)
+    if len(text) <= _MAX_STREAM_LINE_CHARS:
+        return text
+    return text[:_MAX_STREAM_LINE_CHARS - 1] + "…"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────

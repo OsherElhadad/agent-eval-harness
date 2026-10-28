@@ -9,6 +9,7 @@ would carry), then writes a run directory shaped like a real ``fullsend run``:
 repository by the project's post-script.
 """
 
+import io
 import json
 import os
 import subprocess
@@ -88,6 +89,14 @@ FAKE_FULLSEND = textwrap.dedent('''\
             "FAKE_FULLSEND_IMAGE", "ghcr.io/fullsend-ai/sandbox@sha256:" + "a" * 64))
         print("  Arch: arm64")
     print("fullsend console stderr", file=sys.stderr)
+    for var, stream in (("FAKE_FULLSEND_CONSOLE", sys.stdout),
+                        ("FAKE_FULLSEND_CONSOLE_ERR", sys.stderr)):
+        # Replay a console transcript (a file) on that pipe, as the real CLI
+        # prints its steps and the agent's activity; flushed, so a run killed
+        # while it sleeps below has emitted it.
+        if os.environ.get(var):
+            stream.write(Path(os.environ[var]).read_text())
+            stream.flush()
     if os.environ.get("FAKE_FULLSEND_SLEEP"):
         time.sleep(float(os.environ["FAKE_FULLSEND_SLEEP"]))
     if os.environ.get("FAKE_FULLSEND_NO_RUN"):
@@ -189,7 +198,8 @@ def fake_fullsend(fake_bin, tmp_path, monkeypatch):
     for var in ("FAKE_FULLSEND_SLEEP", "FAKE_FULLSEND_EXIT", "FAKE_FULLSEND_ARTIFACTS",
                 "FAKE_FULLSEND_NO_RUN", "FAKE_FULLSEND_HANG_AFTER_RUN",
                 "FAKE_FULLSEND_ITERATIONS",
-                "FAKE_FULLSEND_NO_IMAGE", "FAKE_FULLSEND_IMAGE"):
+                "FAKE_FULLSEND_NO_IMAGE", "FAKE_FULLSEND_IMAGE",
+                "FAKE_FULLSEND_CONSOLE", "FAKE_FULLSEND_CONSOLE_ERR"):
         monkeypatch.delenv(var, raising=False)
     return record
 
@@ -2165,20 +2175,22 @@ class TestInterruptCleanup:
             f"open({str(pidfile)!r}, 'w').write(json.dumps([os.getpid(), child.pid]))\n"
             "time.sleep(60)\n")
 
-        real_popen = subprocess.Popen
+        # Ctrl-C reaches the main thread while it blocks in the console
+        # readers' join (a signal interrupts the lock acquire underneath), so
+        # that is where the fake raises it from.
+        real_join = fullsend_mod._ConsoleCapture.join
         interrupted = []
 
-        class InterruptingPopen(real_popen):
-            def communicate(self, *args, **kwargs):
-                if not interrupted:
-                    interrupted.append(True)
-                    deadline = time.monotonic() + 10
-                    while not pidfile.exists() and time.monotonic() < deadline:
-                        time.sleep(0.05)
-                    raise KeyboardInterrupt
-                return super().communicate(*args, **kwargs)
+        def interrupting_join(self, timeout_s):
+            if not interrupted:
+                interrupted.append(True)
+                deadline = time.monotonic() + 10
+                while not pidfile.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                raise KeyboardInterrupt
+            return real_join(self, timeout_s)
 
-        monkeypatch.setattr(fullsend_mod.subprocess, "Popen", InterruptingPopen)
+        monkeypatch.setattr(fullsend_mod._ConsoleCapture, "join", interrupting_join)
         runner = _runner(tmp_path, term_grace_s=2)
         with pytest.raises(KeyboardInterrupt):
             runner._run([sys.executable, "-c", code], ws, dict(os.environ), 60)
@@ -2299,3 +2311,403 @@ class TestRunDirContainment:
         outside.write_text("{}\n")
         (run / "security" / "link.jsonl").symlink_to(outside)
         assert self._map(tmp_path, ws).raw_output["security_files"] == 1
+
+
+# ── Console capture and live streaming ───────────────────────────────
+
+# A console in the shapes fullsend 0.51 prints (an excerpt of a real two-case
+# run), with every line kind the filter decides on.
+STREAMED_CONSOLE = textwrap.dedent("""\
+    ⚡ fullsend 0.51.0
+      Autonomous agentic development for Git-hosted organizations
+
+    → Running agent: rfe-creator-eval
+      ! Git token not available; private repo skill fetches may fail
+      ✓ Harness loaded (0.5s)
+        Model: claude-opus-4-6 (from --model flag)
+        Timeout: 170 minutes
+      • Running pre-script: /project/.fullsend/pre.sh
+    pre-script: bootstrapping the workspace
+      ✓ Pre-script completed (4.0s)
+      • Creating sandbox: fs-rfe-9223ab8e5c70
+      ✓ Sandbox created (17.6s)
+    → Iteration 1 of 2
+      💬 Good, the batch file exists. Let me read it.
+      ⚙ Read: /sandbox/workspace/batch.yaml
+      ⚙ Bash: JIRA_TOKEN=s3cr3t python3 scripts/submit.py --dry-run
+      🧠 Let me parse the task and follow the skill instructions.
+
+    Task: `/rfe-speedrun --headless --dry-run --input batch.yaml`
+    - `--headless`: true
+      ⏳ Agent running (30s elapsed, 2h49m30s remaining)
+      ⚙ Bash: """ + "python3 scripts/frontmatter.py set " + "x" * 400 + """
+      ✗ Failed to collect OpenShell logs: gateway unreachable
+      ! Skipping transcript export
+      ! Sanitized [env_assignment] in iteration-1/transcripts/a.jsonl: Redacted env_assignment (9 chars) -> ***
+      ! Sanitized 96 finding(s) in output files
+    → Results
+        Agent exit code: 0
+        Validation: passed
+
+      • Running post-script: /project/.fullsend/post.sh
+    Result: action=completed pipeline=rfe-speedrun
+    Error: post-script could not reach Jira (dry run)
+      ✓ Post-script completed (0.1s)
+    """)
+
+# What the filter forwards from STREAMED_CONSOLE, in order.
+STREAMED_FORWARDED = [
+    "⚡ fullsend 0.51.0",
+    "→ Running agent: rfe-creator-eval",
+    "  ! Git token not available; private repo skill fetches may fail",
+    "  ✓ Harness loaded (0.5s)",
+    "    Model: claude-opus-4-6 (from --model flag)",
+    "    Timeout: 170 minutes",
+    "  • Running pre-script: /project/.fullsend/pre.sh",
+    "  ✓ Pre-script completed (4.0s)",
+    "  • Creating sandbox: fs-rfe-9223ab8e5c70",
+    "  ✓ Sandbox created (17.6s)",
+    "→ Iteration 1 of 2",
+    "  💬 Good, the batch file exists. Let me read it.",
+    "  ⚙ Read: /sandbox/workspace/batch.yaml",
+    "  ⚙ Bash: JIRA_TOKEN=*** python3 scripts/submit.py --dry-run",
+    "  ⏳ Agent running (30s elapsed, 2h49m30s remaining)",
+    ("  ⚙ Bash: python3 scripts/frontmatter.py set " + "x" * 400)[:199] + "…",
+    "  ✗ Failed to collect OpenShell logs: gateway unreachable",
+    "  ! Skipping transcript export",
+    "  ! Sanitized 96 finding(s) in output files",
+    "→ Results",
+    "    Agent exit code: 0",
+    "    Validation: passed",
+    "  • Running post-script: /project/.fullsend/post.sh",
+    "Error: post-script could not reach Jira (dry run)",
+    "  ✓ Post-script completed (0.1s)",
+]
+
+STREAMED_DROPPED = [
+    "Autonomous agentic development",
+    "pre-script: bootstrapping",
+    "🧠 Let me parse the task",
+    "Task: `/rfe-speedrun",
+    "- `--headless`: true",
+    "JIRA_TOKEN=s3cr3t",
+    "Sanitized [env_assignment]",
+    "Result: action=completed",
+]
+
+# Claude Code's note (on fullsend's stderr) that the workspace's allow list
+# was dropped — the line behind the eval permission denials, longer than a
+# forwarded line.
+PERMISSIONS_IGNORED_LINE = (
+    "Ignoring 81 permissions.allow entries from .claude/settings.json: this "
+    "workspace has not been trusted. Run Claude Code interactively here once and "
+    "accept the trust dialog, or set projects[\"/sandbox/workspace/case\"]"
+    ".hasTrustDialogAccepted: true in /sandbox/claude-config/.claude.json")
+assert len(PERMISSIONS_IGNORED_LINE) > fullsend_mod._MAX_STREAM_LINE_CHARS
+
+CONSOLE_ERR = ("Cloning into '.context/architecture-context'...\n"
+               "  ✗ Sandbox teardown failed: gateway unreachable\n"
+               + PERMISSIONS_IGNORED_LINE + "\n")
+
+# What the filter forwards from CONSOLE_ERR.
+CONSOLE_ERR_FORWARDED = [
+    "  ✗ Sandbox teardown failed: gateway unreachable",
+    PERMISSIONS_IGNORED_LINE[:fullsend_mod._MAX_STREAM_LINE_CHARS - 1] + "…",
+]
+
+
+def _streamed(capsys, prefix="eval"):
+    """The ``  <prefix> | `` lines the runner printed, prefix removed."""
+    lead = f"  {prefix} | "
+    return [line[len(lead):] for line in capsys.readouterr().out.splitlines()
+            if line.startswith(lead)]
+
+
+class TestConsoleFilter:
+    def _select(self, text):
+        select = fullsend_mod._ConsoleFilter()
+        return [s for s in (select.select(line)
+                            for line in text.splitlines(keepends=True))
+                if s is not None]
+
+    def test_sample_console(self):
+        assert self._select(STREAMED_CONSOLE) == STREAMED_FORWARDED
+
+    def test_detail_lines_follow_a_step_or_section_only(self):
+        text = ("  ✓ Harness loaded (0.5s)\n"
+                "    Model: opus\n"
+                "    Image: img\n"
+                "\n"
+                "    orphan detail after a blank line\n"
+                "  💬 Let me look.\n"
+                "    indented prose under the assistant text\n"
+                "  ! Sanitized [x] in a.jsonl: Redacted\n"
+                "    detail after a dropped line\n"
+                "→ Results\n"
+                "    Validation: passed\n")
+        assert self._select(text) == [
+            "  ✓ Harness loaded (0.5s)", "    Model: opus", "    Image: img",
+            "  💬 Let me look.", "→ Results", "    Validation: passed"]
+
+    def test_plain_alert_lines(self):
+        text = ("Error: boom\n"
+                "WARNING: disk almost full\n"
+                "fatal: not a git repository\n"
+                + PERMISSIONS_IGNORED_LINE + "\n"
+                "Errors: none\n"
+                "Warnings are listed below\n"
+                "Ignoring unknown flag --x\n"
+                "runtime: selected claude\n")
+        assert self._select(text) == [
+            "Error: boom", "WARNING: disk almost full", "fatal: not a git repository",
+            CONSOLE_ERR_FORWARDED[1]]
+
+    def test_thinking_not_forwarded(self):
+        # Parity with the claude-code runner, which streams assistant text and
+        # tool calls but never thinking; the heartbeat after it still is.
+        text = ("  ⚙ Read: batch.yaml\n"
+                "  🧠 Let me think about the Error: handling here.\n"
+                "Error: this is the thinking's own prose, at column 0\n"
+                "    and an indented line of it\n"
+                "  ⏳ Agent running (30s elapsed)\n")
+        assert self._select(text) == [
+            "  ⚙ Read: batch.yaml",
+            "Error: this is the thinking's own prose, at column 0",
+            "  ⏳ Agent running (30s elapsed)"]
+
+    def test_credential_assignments_redacted(self):
+        text = ("  ⚙ Bash: JIRA_TOKEN=abc123 python3 scripts/submit.py "
+                "--api-key=xyz --password=\"a b\" api_secret='q r' "
+                "STAGE=auto-fix rfe_id=RFE-001\n"
+                "Error: GITHUB_TOKEN=ghp_abc rejected\n")
+        assert self._select(text) == [
+            "  ⚙ Bash: JIRA_TOKEN=*** python3 scripts/submit.py "
+            "--api-key=*** --password=*** api_secret=*** "
+            "STAGE=auto-fix rfe_id=RFE-001",
+            "Error: GITHUB_TOKEN=*** rejected"]
+
+    def test_ansi_stripped_padding_trimmed_blank_dropped(self):
+        text = ("\x1b[32m  ✓\x1b[0m Done   \n"
+                "                                        \n"
+                "  ⏳ Agent running.                         \n")
+        assert self._select(text) == ["  ✓ Done", "  ⏳ Agent running."]
+
+    def test_marker_with_variation_selector(self):
+        assert self._select("  ⚙️ Bash: ls\n  •️ Step\n") == [
+            "  ⚙️ Bash: ls", "  •️ Step"]
+
+    def test_long_lines_clipped(self):
+        line = "  ⚙ Bash: " + "y" * 1000
+        (shown,) = self._select(line + "\n")
+        assert len(shown) == fullsend_mod._MAX_STREAM_LINE_CHARS
+        assert shown.endswith("…")
+        assert shown.startswith("  ⚙ Bash: yyy")
+        exact = "  ⚙ Bash: " + "y" * (fullsend_mod._MAX_STREAM_LINE_CHARS - 10)
+        assert self._select(exact + "\n") == [exact]
+
+
+class TestFullsendConsoleStreaming:
+    def _console_files(self, tmp_path, monkeypatch, out=STREAMED_CONSOLE,
+                       err=CONSOLE_ERR):
+        out_file = tmp_path / "console-out.txt"
+        out_file.write_text(out)
+        monkeypatch.setenv("FAKE_FULLSEND_CONSOLE", str(out_file))
+        err_file = tmp_path / "console-err.txt"
+        err_file.write_text(err)
+        monkeypatch.setenv("FAKE_FULLSEND_CONSOLE_ERR", str(err_file))
+
+    def test_lines_forwarded_under_the_prefix_in_order(
+            self, tmp_path, fake_fullsend, monkeypatch, capsys):
+        self._console_files(tmp_path, monkeypatch)
+        ws = _workspace(tmp_path)
+        result = _runner(tmp_path, log_prefix="eval").execute(
+            target="s", args="", workspace=ws, model="m", timeout_s=60)
+        assert result.exit_code == 0
+        streamed = _streamed(capsys)
+        # The launch lines frame the stream, as they did before.
+        assert streamed[0].startswith("Running: ")
+        assert streamed[-1].startswith("OK (")
+        # fullsend's stderr is forwarded too; it is read by its own thread,
+        # so where its lines land among the stdout lines is not fixed.
+        for line in CONSOLE_ERR_FORWARDED:
+            assert streamed.count(line) == 1, line
+        assert "Cloning into '.context/architecture-context'..." not in streamed
+        # fullsend's stdout, forwarded in the order it was printed.
+        from_stdout = [s for s in streamed if s not in CONSOLE_ERR_FORWARDED]
+        first = from_stdout.index(STREAMED_FORWARDED[0])
+        assert from_stdout[first:first + len(STREAMED_FORWARDED)] == STREAMED_FORWARDED
+
+    def test_dropped_lines_not_forwarded(
+            self, tmp_path, fake_fullsend, monkeypatch, capsys):
+        self._console_files(tmp_path, monkeypatch)
+        ws = _workspace(tmp_path)
+        _runner(tmp_path, log_prefix="eval").execute(
+            target="s", args="", workspace=ws, model="m", timeout_s=60)
+        out = capsys.readouterr().out
+        for dropped in STREAMED_DROPPED:
+            assert dropped not in out, dropped
+        assert all(len(line) <= len("  eval | ") + fullsend_mod._MAX_STREAM_LINE_CHARS
+                   for line in out.splitlines())
+
+    def test_full_console_still_captured(
+            self, tmp_path, fake_fullsend, monkeypatch, capsys):
+        self._console_files(tmp_path, monkeypatch)
+        ws = _workspace(tmp_path)
+        result = _runner(tmp_path, log_prefix="eval").execute(
+            target="s", args="", workspace=ws, model="m", timeout_s=60)
+        # Byte for byte what the fake wrote: stdout, then stderr, nothing
+        # filtered, nothing clipped — the provenance parse and stderr.log
+        # read this text.
+        expected_out = ("-> Running agent: rfe-creator-eval\n"
+                        "    Image: ghcr.io/fullsend-ai/sandbox@sha256:" + "a" * 64 + "\n"
+                        "  Arch: arm64\n" + STREAMED_CONSOLE)
+        expected_err = "fullsend console stderr\n" + CONSOLE_ERR
+        assert result.stderr == expected_out + "\n" + expected_err
+        prov = _runner(tmp_path).provenance([result.stderr])
+        assert prov["sandbox_image"] == "ghcr.io/fullsend-ai/sandbox@sha256:" + "a" * 64
+
+    def test_no_streaming_without_log_prefix(
+            self, tmp_path, fake_fullsend, monkeypatch, capsys):
+        self._console_files(tmp_path, monkeypatch)
+        ws = _workspace(tmp_path)
+        result = _runner(tmp_path).execute(
+            target="s", args="", workspace=ws, model="m", timeout_s=60)
+        assert result.exit_code == 0
+        assert STREAMED_CONSOLE in result.stderr
+        assert capsys.readouterr().out == ""
+
+    def test_timeout_streams_then_terminates(
+            self, tmp_path, fake_fullsend, monkeypatch, capsys):
+        self._console_files(tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_FULLSEND_SLEEP", "30")
+        ws = _workspace(tmp_path)
+        result = _runner(tmp_path, term_grace_s=2, log_prefix="eval").execute(
+            target="s", args="", workspace=ws, model="m", timeout_s=1)
+        assert result.exit_code == -1
+        assert result.stderr.startswith("Timed out after 1s\n")
+        # The console emitted before the kill is kept, stdout then stderr.
+        assert STREAMED_CONSOLE in result.stderr
+        assert CONSOLE_ERR in result.stderr
+        assert result.stderr.index(STREAMED_CONSOLE) < result.stderr.index(CONSOLE_ERR)
+        assert result.duration_s < 20
+        streamed = _streamed(capsys)
+        assert "  ✓ Sandbox created (17.6s)" in streamed
+        assert streamed[-1].startswith("FAIL (exit -1)")
+
+    def test_both_pipes_drained_past_the_pipe_buffer(
+            self, tmp_path, fake_fullsend, monkeypatch, capsys):
+        # Far more than a pipe buffer (64 KiB) on each pipe at once: a reader
+        # that served one pipe at a time would deadlock the fake on the other.
+        out = "".join(f"stdout line {i} " + "o" * 80 + "\n" for i in range(20_000))
+        err = "".join(f"stderr line {i} " + "e" * 80 + "\n" for i in range(20_000))
+        self._console_files(tmp_path, monkeypatch, out=out, err=err)
+        ws = _workspace(tmp_path)
+        result = _runner(tmp_path, log_prefix="eval").execute(
+            target="s", args="", workspace=ws, model="m", timeout_s=60)
+        assert result.exit_code == 0
+        assert out in result.stderr
+        assert err in result.stderr
+        assert len(result.stderr) > 2 * len(out)
+        # None of it is worth forwarding.
+        streamed = _streamed(capsys)
+        assert not any("line" in s for s in streamed)
+
+    # A child in place of fullsend: a forwarded first line on each pipe, then
+    # far more than a pipe buffer (64 KiB) of unforwarded text on stdout.
+    _CHATTY_CHILD = textwrap.dedent("""\
+        import sys
+        sys.stdout.write("  ✓ Sandbox created (1.0s)\\n"); sys.stdout.flush()
+        sys.stderr.write("  ✗ Sandbox teardown failed\\n"); sys.stderr.flush()
+        for i in range(20000):
+            sys.stdout.write("x" * 80 + "\\n")
+        sys.stdout.write("  ✓ Done\\n")
+        """)
+    _CHATTY_STDOUT_CHARS = len("  ✓ Sandbox created (1.0s)\n") + 20000 * 81 + len("  ✓ Done\n")
+
+    @pytest.mark.parametrize("harness_stdout", ["ascii", "broken"])
+    def test_forwarding_failure_keeps_draining(self, tmp_path, monkeypatch,
+                                               harness_stdout):
+        # The harness's own stdout cannot take the forwarded line (it cannot
+        # encode the marker, or the pipe behind it is gone): forwarding stops
+        # at the first failure and the reader keeps draining fullsend's pipe,
+        # which would otherwise fill and stall the run until the timeout.
+        writes = []
+        if harness_stdout == "ascii":
+            sink = io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict")
+        else:
+            class Broken(io.TextIOBase):
+                def write(self, text):
+                    writes.append(text)
+                    raise BrokenPipeError(32, "Broken pipe")
+            sink = Broken()
+        monkeypatch.setattr(sys, "stdout", sink)
+        runner = _runner(tmp_path, log_prefix="eval", term_grace_s=1)
+        rc, out, err, duration = runner._run(
+            [sys.executable, "-c", self._CHATTY_CHILD], tmp_path,
+            dict(os.environ), timeout_s=15)
+        assert rc == 0
+        assert duration < 10
+        assert len(out) == self._CHATTY_STDOUT_CHARS
+        assert out.endswith("  ✓ Done\n")
+        assert err == "  ✗ Sandbox teardown failed\n"
+        if harness_stdout == "ascii":
+            assert sink.buffer.getvalue() == b""
+        else:
+            # One attempt per pipe at most, none for the later ✓ Done line.
+            assert 1 <= len(writes) <= 2
+            assert not any("Done" in w for w in writes)
+
+    def test_timeout_notes_pipes_held_past_the_group_kill(
+            self, tmp_path, monkeypatch, capsys):
+        # A descendant outside fullsend's process group (its own session)
+        # inherits the pipes and outlives the group kill: the drain is
+        # bounded and the case's stderr says the console may be cut short.
+        monkeypatch.setattr(fullsend_mod, "_PIPE_DRAIN_S", 1.0)
+        child = textwrap.dedent("""\
+            import subprocess, sys, time
+            held = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                start_new_session=True)
+            print("  ✓ Sandbox created (1.0s)")
+            print("holder", held.pid, flush=True)
+            time.sleep(60)
+            """)
+        runner = _runner(tmp_path, log_prefix="eval", term_grace_s=1)
+        rc, out, err, duration = runner._run(
+            [sys.executable, "-c", child], tmp_path, dict(os.environ), timeout_s=1)
+        try:
+            assert rc == -1
+            assert err.startswith("Timed out after 1s\n")
+            assert "  ✓ Sandbox created (1.0s)\n" in err
+            assert err.endswith("Console pipes still open after the group kill")
+            assert "Process group termination hung" not in err  # the leader exited
+            assert duration < 10
+            assert "  ✓ Sandbox created (1.0s)" in _streamed(capsys)
+        finally:
+            holder = int(err.split("holder ", 1)[1].split()[0])
+            os.kill(holder, 9)
+
+    @pytest.mark.parametrize("ending", ["exit", "timeout"])
+    def test_pipes_closed_once_drained(self, tmp_path, fake_fullsend, monkeypatch,
+                                       capsys, ending):
+        # communicate() closed the pipes; the readers do now (no unclosed-file
+        # ResourceWarning when the Popen is collected).
+        procs = []
+
+        class Recording(fullsend_mod._ConsoleCapture):
+            def __init__(self, proc, log_prefix=None):
+                procs.append(proc)
+                super().__init__(proc, log_prefix)
+
+        monkeypatch.setattr(fullsend_mod, "_ConsoleCapture", Recording)
+        self._console_files(tmp_path, monkeypatch)
+        timeout_s = 60
+        if ending == "timeout":
+            monkeypatch.setenv("FAKE_FULLSEND_SLEEP", "30")
+            timeout_s = 1
+        ws = _workspace(tmp_path)
+        result = _runner(tmp_path, term_grace_s=2, log_prefix="eval").execute(
+            target="s", args="", workspace=ws, model="m", timeout_s=timeout_s)
+        assert result.exit_code == (0 if ending == "exit" else -1)
+        (proc,) = procs
+        assert proc.stdout.closed and proc.stderr.closed

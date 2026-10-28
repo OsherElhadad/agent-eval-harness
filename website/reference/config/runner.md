@@ -403,6 +403,33 @@ runner:
   extra_args: [--keep-sandbox]
 ```
 
+#### Live progress
+
+While the harness logs progress (the `  eval | ` lines of a batch run, `  eval:<case> | `
+per case) the runner streams a filtered subset of fullsend's console as it runs, under
+that prefix, between its `Running: …` and `OK`/`FAIL` lines: the section and step lines
+(`→`, `•`, `✓`, `✗`, `!`) with the detail lines indented under them (the plan block
+after `Harness loaded`, the `→ Results` block), the agent activity lines (`💬` text,
+`⚙` tool call, `⏳` heartbeat), plain `Error`/`Warning`/`fatal` lines and Claude Code's
+`Ignoring N permissions.allow entries …` line (the one behind permission denials in a
+sandbox that has not trusted the workspace), each cut at 200 characters. A forwarded
+line has `KEY=value` assignments whose key names a credential (`…token=`, `…secret=`,
+`…password=`, `…api_key=`) shown as `KEY=***`, as a `⚙ Bash:` line may carry one.
+The per-finding `! Sanitized […]` lines, the assistant's thinking (`🧠`, which the
+`claude-code` runner does not stream either) and multi-line text, and the pre/post-script
+output are not forwarded. A two-case run forwards about 360 lines (30 KB), so a long
+batch stays well inside a CI job log's output limit. The full console (stdout, then
+stderr) is still the case's `stderr.log`, unfiltered and unredacted, and the sandbox
+image is still read from it. There is no knob: streaming follows the harness's progress
+logging, as it does for the `claude-code` runner.
+
+fullsend writes some `💬` lines without a trailing newline, so they reach the log only
+when its next write ends the line — usually the `⏳` heartbeat, up to 30 seconds later,
+glued onto the same line (`💬 … ⏳ Agent running (…)`). That delay is not a stall. A
+timed-out run whose console pipes are still held open five seconds after the group kill
+(a descendant outside fullsend's process group) ends its `stderr.log` with
+`Console pipes still open after the group kill`: the console may be cut short.
+
 #### Run provenance
 
 A fullsend run records what executed it, so results stay comparable across runs.
