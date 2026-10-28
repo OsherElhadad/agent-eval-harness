@@ -1,3 +1,10 @@
+# [1.61.0](https://github.com/fullsend-ai/agent-eval-harness/compare/v1.60.1...v1.61.0) (2026-10-28)
+
+
+### Features
+
+* **runner:** record fullsend provenance with each run ([#275](https://github.com/fullsend-ai/agent-eval-harness/issues/275)) ([fb570fb](https://github.com/fullsend-ai/agent-eval-harness/commit/fb570fbaec2c1ba9aae2e2e3bf38c2d5ebd6b230)), closes [#262](https://github.com/fullsend-ai/agent-eval-harness/issues/262)
+
 ## [1.60.1](https://github.com/fullsend-ai/agent-eval-harness/compare/v1.60.0...v1.60.1) (2026-10-27)
 
 
