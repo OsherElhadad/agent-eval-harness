@@ -1,3 +1,10 @@
+## [1.61.1](https://github.com/fullsend-ai/agent-eval-harness/compare/v1.61.0...v1.61.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **score:** close the third origin of incomplete evidence, and arm the gate for baselines ([#276](https://github.com/fullsend-ai/agent-eval-harness/issues/276)) ([dc3a87e](https://github.com/fullsend-ai/agent-eval-harness/commit/dc3a87e39e10287b11ed62e7807ce7925c1bf733)), closes [#260](https://github.com/fullsend-ai/agent-eval-harness/issues/260) [#260](https://github.com/fullsend-ai/agent-eval-harness/issues/260)
+
 # [1.61.0](https://github.com/fullsend-ai/agent-eval-harness/compare/v1.60.1...v1.61.0) (2026-10-28)
 
 
