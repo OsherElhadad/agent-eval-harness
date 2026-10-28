@@ -1,3 +1,10 @@
+## [1.61.2](https://github.com/fullsend-ai/agent-eval-harness/compare/v1.61.1...v1.61.2) (2026-10-28)
+
+
+### Bug Fixes
+
+* **score:** compute min_win_rate from the pairwise section ([#282](https://github.com/fullsend-ai/agent-eval-harness/issues/282)) ([24da475](https://github.com/fullsend-ai/agent-eval-harness/commit/24da4752cfa639e9b83da39f66d983f94bbadb4f)), closes [#281](https://github.com/fullsend-ai/agent-eval-harness/issues/281)
+
 ## [1.61.1](https://github.com/fullsend-ai/agent-eval-harness/compare/v1.61.0...v1.61.1) (2026-10-28)
 
 
