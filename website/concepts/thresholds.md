@@ -68,6 +68,10 @@ that is *not* silently ignored.
     good score with nine errors passes a `min_mean` outright. The report shows `ERROR` for
     the judge only when *no* case produced a value.
 
+    One class of error is exempt: a case where the judge was denied material it
+    should have graded fails the run on its own, with no `max_error_rate` set.
+    See [incomplete evidence](../reference/runs-directory.md#incomplete-evidence).
+
     ```yaml
     thresholds:
       completeness:
@@ -148,7 +152,10 @@ python3 skills/eval-run/scripts/score.py regression \
 
 For each judge present in both runs, the current `mean` and `pass_rate` are compared to
 the baseline's. A drop of **more than 0.5** (absolute) is reported as a
-`<metric>_vs_baseline` regression:
+`<metric>_vs_baseline` regression. Because that comparison gates on a score, it also
+arms the [incomplete evidence](../reference/runs-directory.md#incomplete-evidence) gate
+for those judges — a run that withheld evidence cannot clear a baseline on its
+survivors either:
 
 ```text
   [completeness] mean_vs_baseline: 4.2 -> 3.4   Degraded vs baseline

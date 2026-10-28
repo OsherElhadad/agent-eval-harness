@@ -34,6 +34,11 @@ still reports a `mean` over the survivors and passes `min_mean`. Declare
 is off unless declared — one flaky judge run should not fail a suite by
 default.
 
+One class of error does not merely shrink the sample: a case where the judge
+was denied material it should have graded blocks every score threshold and
+every baseline comparison on its own, whether or not `max_error_rate` is set.
+See [incomplete evidence](../runs-directory.md#incomplete-evidence).
+
 You may set more than one key per judge; each is checked independently. The
 three `min_*` keys are compared with `<` and `max_error_rate` with `>`, so a
 metric exactly equal to its threshold **passes** either way.
@@ -131,6 +136,15 @@ REGRESSIONS: 1 detected
 
 Baseline degradation is only checked for metrics present in both runs; the
 0.5 delta is fixed and not configurable.
+
+Passing a baseline also arms the [incomplete evidence](../runs-directory.md#incomplete-evidence)
+gate, since a baseline comparison rests on a score the same way `min_mean` does.
+A judge with only `max_error_rate` set is otherwise exempt from that gate; with a
+comparable baseline it is not.
+
+Both the comparison and that gate only run for judges that **have a `thresholds:`
+entry** — `detect_regressions` iterates the threshold map, so a judge named nowhere
+in it is never examined, baseline or no baseline.
 
 ## Related
 

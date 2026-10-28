@@ -1390,16 +1390,23 @@ class TestAgentJudgeHardening:
 
     def test_staging_rejects_path_traversal(self, tmp_path):
         """A '..'-bearing output path must not stage material from outside
-        the case dir (CWE-22); the in-case output dir still stages."""
-        from score import _stage_agent_workspace
+        the case dir (CWE-22); the in-case output dir still stages.
+
+        Raised as `StagingIncomplete` rather than the bare `ValueError`: the
+        escaping tree is content the judge should have graded and did not, so
+        it has to reach `incomplete_cases`. As a plain error the case merely
+        left the denominator and a score threshold passed on the survivors.
+        """
+        from score import StagingIncomplete, _stage_agent_workspace
         (tmp_path / "secret").mkdir()
         (tmp_path / "secret" / "evil.txt").write_text("PWNED")
         record = _make_case(tmp_path / "case", {"sub/ok.txt": "fine"})
         ws = tmp_path / "ws"
         ws.mkdir()
-        with pytest.raises(ValueError, match="escapes"):
+        with pytest.raises(StagingIncomplete, match="escapes") as exc:
             _stage_agent_workspace(ws, record, None, [], tmp_path,
                                    ["sub", "../secret"])
+        assert exc.value.lost, "the escaping tree must be recorded as lost"
         assert not (ws / "secret").exists()
         assert not any(p.name == "evil.txt" for p in ws.rglob("*"))
         assert (ws / "sub" / "ok.txt").read_text() == "fine"
@@ -1953,3 +1960,600 @@ class TestIncompleteStagingCannotPass:
         assert agg["errored_cases"] == 10    # the judge could not be set up
         assert agg["incomplete_cases"] == 0  # but that is not withheld evidence
         assert "staging_skips" not in res["per_case"]["c0"]["arch_score"]
+
+
+class TestEvidenceLostBeforeStaging:
+    """Hardening staging closed two of the three ways a judge ends up grading
+    nothing. The third is upstream of it: `load_case_record` reads the declared
+    output trees whenever ANY judge needs file contents, and an unreadable file
+    raises there — before `_stage_agent_workspace` is ever called. That arrived
+    as a plain error, so `incomplete_cases` stayed 0 and a score threshold
+    passed on the survivors, exactly the escape the staging gate closes.
+
+    These drive the real `score_cases`; a helper that recomputed the
+    aggregation would pass against the bug.
+    """
+
+    def _runner(self):
+        class R:
+            @classmethod
+            def from_config(cls, config, *, log_prefix=None, **overrides):
+                return cls()
+
+            @property
+            def name(self):
+                return "stg"
+
+            def execute(self, target=None, args="", workspace=None,
+                        model=None, **kwargs):
+                out = Path(workspace) / "output"
+                out.mkdir(parents=True, exist_ok=True)
+                (out / "score.json").write_text(
+                    json.dumps({"passed": True, "rationale": "x"}))
+                return RunResult(exit_code=0, stdout="", stderr="",
+                                 duration_s=0.01)
+        return R
+
+    @contextmanager
+    def _unreadable(self, path):
+        mode = path.stat().st_mode & 0o777
+        path.chmod(0)
+        try:
+            yield
+        finally:
+            path.chmod(mode)
+
+    def _mixed_config(self, tmp_path):
+        """An agent judge AND a check judge.
+
+        The second judge is the whole point: `_judges_read_files` returns True
+        as soon as one non-agent judge is configured, which is what turns on
+        the record-loading pass this class is about. An all-agent-judge run
+        never reads the trees and never reaches the bug.
+        """
+        config = _config(_agent_judge(feedback_type="bool", inputs=["out"]),
+                         outputs=["out"])
+        config.judges = [config.judges[0],
+                         JudgeConfig(name="shape", check="return True, 'ok'")]
+        return config
+
+    def _run(self, tmp_path, cases):
+        import score
+        config = self._mixed_config(tmp_path)
+        with _patched_runners(self._runner()):
+            return score.score_cases(
+                load_judges(config, project_root=str(tmp_path)), cases, config)
+
+    def _case(self, tmp_path, name):
+        case_dir = tmp_path / name
+        _make_case(case_dir, {"out/ok.md": "fine"})
+        return case_dir
+
+    def _rest(self, tmp_path):
+        return [self._case(tmp_path, f"c{i}") for i in range(1, 10)]
+
+    def _gate(self, res, thresholds, baseline=None):
+        from score import detect_regressions
+        return [r.metric for r in detect_regressions(
+            res["aggregated"], thresholds, baseline)]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_an_unreadable_artifact_blocks_a_score_threshold(self, tmp_path):
+        bad = self._case(tmp_path, "c0")
+        target = bad / "out" / "bad.txt"
+        target.write_text("FAILING EVIDENCE")
+        with self._unreadable(target):
+            res = self._run(tmp_path, [bad] + self._rest(tmp_path))
+        for judge in ("arch_score", "shape"):
+            agg = res["aggregated"][judge]
+            # No judge ran on that case, so the omission is recorded against
+            # every one of them — including `shape`, which reads no files.
+            assert agg["incomplete_cases"] == 1, judge
+            assert agg["errored_cases"] == 1, judge
+            assert "incomplete_staging" in self._gate(
+                res, {judge: {"min_pass_rate": 0.9}}), judge
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_an_unlistable_directory_blocks_a_score_threshold(self, tmp_path):
+        """The quieter half of the same hole, and the worse one.
+
+        An unreadable FILE raises out of the record load. An unreadable
+        DIRECTORY did not: `rglob` yields the entry and nothing beneath it
+        without raising, so the artifact simply left the record and the case
+        scored normally over what remained — no error, nothing to count.
+        """
+        bad = self._case(tmp_path, "c0")
+        sub = bad / "out" / "sub"
+        sub.mkdir()
+        (sub / "evidence.txt").write_text("FAILING EVIDENCE")
+        with self._unreadable(sub):
+            res = self._run(tmp_path, [bad] + self._rest(tmp_path))
+        for judge in ("arch_score", "shape"):
+            assert res["aggregated"][judge]["incomplete_cases"] == 1, judge
+            assert "incomplete_staging" in self._gate(
+                res, {judge: {"min_pass_rate": 0.9}}), judge
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_the_omission_is_pointed_at_a_field_that_exists(self, tmp_path):
+        """The regression text says "see `staging_skips`", so the record-load
+        path has to write one rather than send the operator to a missing key."""
+        bad = self._case(tmp_path, "c0")
+        target = bad / "out" / "bad.txt"
+        target.write_text("FAILING EVIDENCE")
+        with self._unreadable(target):
+            res = self._run(tmp_path, [bad] + self._rest(tmp_path))
+        skips = res["per_case"]["c0"]["arch_score"]["staging_skips"]
+        assert skips["count"] == 1
+        assert skips["reasons"] == {"content not staged": 1}
+        # Each judge gets its OWN summary object. Summarising once and sharing
+        # it makes `yaml.dump` write the second occurrence as an `*id001`
+        # alias into summary.yaml, which not every reader of that file handles.
+        other = res["per_case"]["c0"]["shape"]["staging_skips"]
+        assert other == skips and other is not skips
+        import yaml
+        assert "*id001" not in yaml.dump(res["per_case"],
+                                         default_flow_style=False)
+
+    def test_an_output_dir_pointing_out_of_the_case_counts(self, tmp_path):
+        """Not an `OSError`, and the reason the guard does not name types.
+
+        A declared output that is a symlink out of the case dir makes
+        `_resolve_under` raise `ValueError`, so a guard spelled `except
+        OSError` would have been the same enumeration bug one layer down: the
+        judge sees nothing and the run passes on the survivors. (A file with
+        invalid UTF-8 escapes the `(YAMLError, OSError)` handlers the same
+        way.)
+        """
+        elsewhere = tmp_path / "elsewhere"
+        (elsewhere / "out").mkdir(parents=True)
+        (elsewhere / "out" / "hidden.md").write_text("FAILING EVIDENCE")
+        bad = tmp_path / "c0"
+        bad.mkdir()
+        os.symlink(elsewhere / "out", bad / "out")
+        res = self._run(tmp_path, [bad] + self._rest(tmp_path))
+        agg = res["aggregated"]["shape"]
+        assert agg["incomplete_cases"] == 1
+        assert agg["errored_cases"] == 1
+        assert "incomplete_staging" in self._gate(
+            res, {"shape": {"min_pass_rate": 0.9}})
+
+    def test_a_failure_after_the_record_stays_an_ordinary_error(self, tmp_path):
+        """The guard wraps the record load and nothing else.
+
+        Scope is what keeps the previous test from becoming "any exception
+        fails the run": a judge that blows up has not been DENIED evidence,
+        and `max_error_rate` must keep pricing it. This is the same line
+        `agent.context` draws (see
+        `TestIncompleteStagingCannotPass.test_an_agent_context_failure_...`).
+        """
+        import score
+        cases = [self._case(tmp_path, f"c{i}") for i in range(10)]
+        config = self._mixed_config(tmp_path)
+        config.judges = [JudgeConfig(name="shape",
+                                     check="raise RuntimeError('boom')")]
+        with _patched_runners(self._runner()):
+            res = score.score_cases(
+                load_judges(config, project_root=str(tmp_path)), cases, config)
+        agg = res["aggregated"]["shape"]
+        assert agg["errored_cases"] == 10
+        assert agg["incomplete_cases"] == 0
+        assert self._gate(res, {"shape": {"max_error_rate": 1.0}}) == []
+
+    # A baseline comparison gates on a score exactly as `min_pass_rate` does,
+    # so enumerating the three score keys left the same escape one door along:
+    # with a tolerant `max_error_rate` as the only threshold, an incomplete run
+    # whose survivors match the baseline reported nothing at all.
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_baseline_comparison_cannot_pass_on_the_survivors(self, tmp_path):
+        bad = self._case(tmp_path, "c0")
+        (bad / "out" / "bad.txt").write_text("FAILING EVIDENCE")
+        with self._unreadable(bad / "out" / "bad.txt"):
+            res = self._run(tmp_path, [bad] + self._rest(tmp_path))
+        # 1 of 10 unscored, and the author budgeted for half the dataset — so
+        # `max_error_rate` is satisfied and the survivors match the baseline
+        # exactly. Before this, that combination reported nothing.
+        assert self._gate(res, {"arch_score": {"max_error_rate": 0.5}}) == []
+        assert "incomplete_staging" in self._gate(
+            res, {"arch_score": {"max_error_rate": 0.5}},
+            {"arch_score": {"pass_rate": 1.0}})
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_baseline_with_nothing_comparable_does_not_fire(self, tmp_path):
+        """The guard mirrors the comparison it protects: a baseline carrying no
+        `mean` or `pass_rate` compares nothing, so there is no score to refuse.
+        Firing on the mere presence of a baseline would make an error budget
+        impossible to use alongside one."""
+        bad = self._case(tmp_path, "c0")
+        (bad / "out" / "bad.txt").write_text("FAILING EVIDENCE")
+        with self._unreadable(bad / "out" / "bad.txt"):
+            res = self._run(tmp_path, [bad] + self._rest(tmp_path))
+        assert self._gate(res, {"arch_score": {"max_error_rate": 0.5}},
+                          {"arch_score": {"win_rate": 1.0}}) == []
+        assert self._gate(res, {"arch_score": {"max_error_rate": 0.5}},
+                          {"other_judge": {"pass_rate": 1.0}}) == []
+
+    def test_an_output_escaping_the_case_counts_for_an_agent_only_run(
+            self, tmp_path):
+        """The agent-only path reaches containment through STAGING, not the
+        record load — `load_files` is false, so `load_case_record` never looks
+        at the trees. Staging raised a bare `ValueError`, which made the case
+        an ordinary error: it left the denominator and the run passed on the
+        survivors, which is the escape this gate exists to close."""
+        import score
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.md").write_text("elsewhere")
+        bad = self._case(tmp_path, "c0")
+        os.symlink(outside, bad / "_modified")
+        for c in self._rest(tmp_path):
+            (c / "_modified").mkdir(exist_ok=True)
+
+        judge = _agent_judge(feedback_type="bool", inputs=["."])
+        config = _config(judge, outputs=["out"])
+        with _patched_runners(self._runner()):
+            judges = load_judges(config, project_root=str(tmp_path))
+            assert not score._judges_read_files(judges), "must be agent-only"
+            res = score.score_cases(judges, [bad] + self._rest(tmp_path),
+                                    config)
+        agg = res["aggregated"]["arch_score"]
+        assert agg["incomplete_cases"] == 1
+        assert "incomplete_staging" in [r.metric for r in score.detect_regressions(
+            res["aggregated"], {"arch_score": {"min_pass_rate": 0.9}})]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_run_that_measured_nothing_cannot_clear_a_baseline(self, tmp_path):
+        """The guard must not fail open when EVERY case is incomplete. There
+        is no `mean`/`pass_rate` left to compare then, so requiring both sides
+        of the comparison to exist silently disarmed it on the most broken
+        run there is."""
+        cases = []
+        for i in range(3):
+            c = self._case(tmp_path, f"c{i}")
+            (c / "out" / "bad.txt").write_text("FAILING EVIDENCE")
+            cases.append(c)
+        with self._unreadable(cases[0] / "out" / "bad.txt"), \
+                self._unreadable(cases[1] / "out" / "bad.txt"), \
+                self._unreadable(cases[2] / "out" / "bad.txt"):
+            res = self._run(tmp_path, cases)
+        agg = res["aggregated"]["arch_score"]
+        assert agg["incomplete_cases"] == 3 and agg["scored_cases"] == 0
+        assert agg["mean"] is None and agg["pass_rate"] is None
+        assert "incomplete_staging" in self._gate(
+            res, {"arch_score": {"max_error_rate": 1.0}},
+            {"arch_score": {"pass_rate": 1.0}})
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_an_unreadable_harness_namespace_does_not_block_grading(
+            self, tmp_path):
+        """`_modified/.work`, `/hooks` and `/subagents` are the harness's own
+        and are never judge evidence. Probing them for listability before
+        pruning them charged the case for losing something nothing was going
+        to grade — the gate firing on a run that lost nothing."""
+        bad = self._case(tmp_path, "c0")
+        work = bad / "_modified" / ".work" / "inner"
+        work.mkdir(parents=True)
+        (work / "scratch.txt").write_text("harness scratch")
+        (bad / "_modified" / "real.md").write_text("an actual edit")
+        with self._unreadable(work):
+            res = self._run(tmp_path, [bad] + self._rest(tmp_path))
+        agg = res["aggregated"]["arch_score"]
+        assert agg["incomplete_cases"] == 0
+        assert self._gate(res, {"arch_score": {"min_pass_rate": 0.9}}) == []
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    @pytest.mark.parametrize("declared", ["_modified", "."])
+    def test_an_unreadable_harness_namespace_under_a_declared_output(
+            self, tmp_path, declared):
+        """The declared-output walk reaches `_modified` too: directly
+        (`outputs: [_modified]`) or as part of a larger tree (`outputs: ["."]`).
+        Both must prune the harness namespaces before probing, exactly as the
+        `_modified` walk does — the existing test above declares only `out`
+        and so passed while this path was broken."""
+        import score
+        config = _config(_agent_judge(feedback_type="bool", inputs=["out"]),
+                         outputs=[declared])
+        config.judges = [
+            config.judges[0],
+            JudgeConfig(name="graded", check=(
+                'return ("_modified/real.md" in outputs["files"] '
+                'and outputs["files"].get("out/ok.md", "fine") == "fine"), "ok"'))]
+
+        def case(name):
+            c = tmp_path / name
+            _make_case(c, {"out/ok.md": "fine", "_modified/real.md": "an edit"})
+            return c
+
+        bad = case("c0")
+        work = bad / "_modified" / ".work" / "inner"
+        work.mkdir(parents=True)
+        (work / "scratch.txt").write_text("harness scratch")
+        cases = [bad] + [case(f"c{i}") for i in range(1, 10)]
+        with self._unreadable(work), _patched_runners(self._runner()):
+            res = score.score_cases(
+                load_judges(config, project_root=str(tmp_path)), cases, config)
+        for judge in ("arch_score", "graded"):
+            agg = res["aggregated"][judge]
+            assert agg["incomplete_cases"] == 0, judge
+            assert agg["scored_cases"] == 10, judge
+            assert self._gate(res, {judge: {"min_pass_rate": 0.9}}) == [], judge
+        # The readable artifacts were still read and graded.
+        assert res["aggregated"]["graded"]["pass_rate"] == 1.0
+
+    @contextmanager
+    def _mode(self, path, mode):
+        old = path.stat().st_mode & 0o777
+        path.chmod(mode)
+        try:
+            yield
+        finally:
+            path.chmod(old)
+
+    def _score_with_work_0400(self, tmp_path, outputs):
+        """Score ten cases, one with `_modified/.work` at mode 0400.
+
+        0400 is readable but not searchable: `rglob` LISTS the children and
+        every stat on them is denied. Mode 000 (the tests above) lists
+        nothing, so it cannot tell a prune that runs before the first stat
+        from one that runs after it. Returns ``(res, aggregated-per-judge)``.
+        """
+        import score
+        config = _config(_agent_judge(feedback_type="bool", inputs=["out"]),
+                         outputs=outputs)
+        config.judges = [
+            config.judges[0],
+            JudgeConfig(name="graded", check=(
+                'return ("_modified/real.md" in outputs["files"] '
+                'and outputs["files"].get("out/ok.md", "fine") == "fine"), "ok"'))]
+
+        def case(name):
+            c = tmp_path / name
+            _make_case(c, {"out/ok.md": "fine", "_modified/real.md": "an edit"})
+            return c
+
+        bad = case("c0")
+        work = bad / "_modified" / ".work"
+        (work / "inner").mkdir(parents=True)
+        (work / "child.txt").write_text("harness scratch")
+        (work / "inner" / "scratch.txt").write_text("harness scratch")
+        cases = [bad] + [case(f"c{i}") for i in range(1, 10)]
+        with self._mode(work, 0o400), _patched_runners(self._runner()):
+            res = score.score_cases(
+                load_judges(config, project_root=str(tmp_path)), cases, config)
+        return res
+
+    def _assert_nothing_lost(self, res):
+        for judge in ("arch_score", "graded"):
+            agg = res["aggregated"][judge]
+            assert agg["incomplete_cases"] == 0, judge
+            assert agg["scored_cases"] == 10, judge
+            assert self._gate(res, {judge: {"min_pass_rate": 0.9}}) == [], judge
+        # The readable artifacts were still read and graded.
+        assert res["aggregated"]["graded"]["pass_rate"] == 1.0
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    @pytest.mark.parametrize("declared", ["_modified", ".", "out"])
+    def test_a_listable_but_unsearchable_harness_namespace_is_pruned(
+            self, tmp_path, declared):
+        """The prune is decided from the PATH, before any stat. A `.work` at
+        mode 0400 yields its children to the walk but denies the `is_symlink()`
+        stat on them, so a prune sitting behind that stat still failed."""
+        res = self._score_with_work_0400(tmp_path, [declared])
+        self._assert_nothing_lost(res)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_declared_output_under_an_unsearchable_harness_dir(
+            self, tmp_path):
+        """`outputs: [_modified/.work/inner]` is harness-owned, and `exists()`
+        / `resolve()` on it stat THROUGH `.work` — so the per-output prune has
+        to come before them, not after."""
+        res = self._score_with_work_0400(
+            tmp_path, ["_modified/.work/inner", "out"])
+        self._assert_nothing_lost(res)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_an_unreadable_namespace_declared_directly_is_pruned(self, tmp_path):
+        """`outputs: [_modified/.work]` is itself harness-owned: the walk, the
+        listability probe and the first-file convenience scan all skip it."""
+        import score
+        config = _config(_agent_judge(feedback_type="bool", inputs=["out"]),
+                         outputs=["_modified/.work"])
+        c = tmp_path / "c0"
+        _make_case(c, {"out/ok.md": "fine", "_modified/.work/x": "s"})
+        work = c / "_modified" / ".work"
+        with self._unreadable(work), _patched_runners(self._runner()):
+            record = score.load_case_record(c, config)
+        assert record["files"] == {}
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_an_unreadable_dir_outside_the_namespace_still_counts(
+            self, tmp_path):
+        """The pruning is for the harness's namespaces only: an unreadable
+        directory next to them under `_modified` is real evidence lost."""
+        import score
+        config = _config(_agent_judge(feedback_type="bool", inputs=["out"]),
+                         outputs=["."])
+        c = tmp_path / "c0"
+        _make_case(c, {"out/ok.md": "fine", "_modified/src/x.py": "edit"})
+        with self._unreadable(c / "_modified" / "src"), \
+                pytest.raises(OSError):
+            score.load_case_record(c, config)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_numeric_judge_arms_the_gate_through_mean(self, tmp_path):
+        """`mean` is the half a boolean judge cannot exercise.
+
+        A bool judge copies `pass_rate` into `mean`, so either term arms the
+        gate and dropping `"mean"` from the condition still passes. A numeric
+        judge sets `mean` and leaves `pass_rate` None, which makes `"mean"`
+        the only term that can.
+        """
+        import score
+        bad = self._case(tmp_path, "c0")
+        (bad / "out" / "bad.txt").write_text("FAILING EVIDENCE")
+        config = self._mixed_config(tmp_path)
+        config.judges = [JudgeConfig(name="depth", check="return 4.0, 'ok'")]
+        with self._unreadable(bad / "out" / "bad.txt"), \
+                _patched_runners(self._runner()):
+            res = score.score_cases(
+                load_judges(config, project_root=str(tmp_path)),
+                [bad] + self._rest(tmp_path), config)
+        agg = res["aggregated"]["depth"]
+        assert agg["mean"] == 4.0 and agg["pass_rate"] is None
+        assert agg["incomplete_cases"] == 1
+        assert self._gate(res, {"depth": {"max_error_rate": 0.5}}) == []
+        assert "incomplete_staging" in self._gate(
+            res, {"depth": {"max_error_rate": 0.5}}, {"depth": {"mean": 4.0}})
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_conditional_judge_is_charged_too(self, tmp_path):
+        """Deliberate, and pinned here because it is a real cost.
+
+        An `if:` condition is evaluated against the case record, so when the
+        record cannot be read there is no way to know whether the judge would
+        have graded the case or skipped it. Charging every judge is the
+        conservative read: letting a judge off because it *might* have been
+        skipped would hand the skill under test a lever — make the artifact
+        unreadable and any conditional judge quietly stops counting. The cost
+        is a judge that would have skipped the case failing its threshold.
+        """
+        import score
+        bad = self._case(tmp_path, "c0")
+        (bad / "out" / "bad.txt").write_text("FAILING EVIDENCE")
+        config = self._mixed_config(tmp_path)
+        config.judges = [JudgeConfig(name="only_x", check="return True, 'ok'",
+                                     condition="annotations.get('k') == 'x'")]
+        with self._unreadable(bad / "out" / "bad.txt"), \
+                _patched_runners(self._runner()):
+            res = score.score_cases(
+                load_judges(config, project_root=str(tmp_path)),
+                [bad] + self._rest(tmp_path), config)
+        assert res["aggregated"]["only_x"]["incomplete_cases"] == 1
+        assert "incomplete_staging" in self._gate(
+            res, {"only_x": {"min_pass_rate": 0.9}})
+
+
+class TestPairwiseEvidenceLoss:
+    """`load_case_record` raises when a case directory cannot be read. The
+    pairwise path called it twice with no guard and read the futures with no
+    guard either, so one `chmod 000` directory in EITHER run took the whole
+    `score.py pairwise` invocation down with a traceback — and recorded
+    nothing about the case it lost."""
+
+    @contextmanager
+    def _unreadable(self, path):
+        mode = path.stat().st_mode & 0o777
+        path.chmod(0)
+        try:
+            yield
+        finally:
+            path.chmod(mode)
+
+    def _runs(self, tmp_path):
+        for run in ("a", "b"):
+            for cid in ("c0", "c1"):
+                _make_case(tmp_path / run / "cases" / cid,
+                           {"out/r.md": f"{run} {cid}"})
+        return tmp_path / "a", tmp_path / "b"
+
+    def _compare(self, a, b, cases):
+        import score
+        config = _config(_agent_judge(), outputs=["out"])
+        with patch("score._format_outputs_for_pairwise", return_value="output"), \
+                patch("score._call_judge",
+                      return_value=({"preferred": "A", "reasoning": "r"}, None)), \
+                patch("score._get_anthropic_client", return_value=object()):
+            return score.compare_runs(a, b, config, cases,
+                                      model="claude-sonnet-4-6")
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_one_unreadable_case_does_not_abort_the_comparison(self, tmp_path):
+        a, b = self._runs(tmp_path)
+        bad = b / "cases" / "c0" / "out" / "sub"
+        bad.mkdir()
+        (bad / "evidence.md").write_text("FAILING EVIDENCE")
+        with self._unreadable(bad):
+            res = self._compare(a, b, ["c0", "c1"])
+        assert "error" not in res
+        assert res["cases_compared"] == 2        # c1 still compared
+        assert res["incomplete_cases"] == 1
+        bad_row = next(r for r in res["per_case"] if r["case_id"] == "c0")
+        assert bad_row["winner"] == "error"
+        assert "content not staged" in bad_row["error"]
+        assert next(r for r in res["per_case"]
+                    if r["case_id"] == "c1")["winner"] != "error"
+
+    def test_a_clean_pair_reports_no_evidence_loss(self, tmp_path):
+        a, b = self._runs(tmp_path)
+        res = self._compare(a, b, ["c0", "c1"])
+        assert res["incomplete_cases"] == 0
+        assert res["errors"] == 0
+
+
+class TestModifiedTreeContainment:
+    """`_modified` is agent-produced and `exists()` follows a symlink, so the
+    listability probe and `rglob` would both enumerate an outside target
+    before any boundary check ran."""
+
+    def test_a_symlinked_modified_dir_is_refused_before_listing(self, tmp_path):
+        import score
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.md").write_text("not the agent's to show")
+        case_dir = tmp_path / "case-001"
+        _make_case(case_dir, {"out/r.md": "fine"})
+        os.symlink(outside, case_dir / "_modified")
+
+        config = _config(_agent_judge(), outputs=["out"])
+        scanned = []
+        real_scandir = os.scandir
+
+        def watched(path, *a, **kw):
+            # RESOLVED: `_modified` is a symlink, so the path handed to
+            # scandir is inside the case even when its target is not.
+            scanned.append(os.path.realpath(path))
+            return real_scandir(path, *a, **kw)
+
+        with patch("score.os.scandir", side_effect=watched):
+            with pytest.raises(ValueError, match="escapes root"):
+                score.load_case_record(case_dir, config, load_files=True)
+        assert str(outside.resolve()) not in scanned, (
+            f"listed outside the case before validating: {scanned}")
+
+
+class TestEntryClassificationIsVersionIndependent:
+    """`Path.is_dir()`/`is_file()` answer False for anything they cannot stat,
+    and whether a DENIED stat counts as "cannot" is a pathlib policy that has
+    changed across versions (EACCES propagates on 3.11-3.13, reported
+    swallowed on 3.14). A readable-but-not-searchable directory lists its
+    names but denies stat on the children, so under the swallowing policy
+    those children would be dropped with nothing recorded."""
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_denied_stat_is_never_silently_a_non_file(self, tmp_path):
+        from score import _entry_kind
+        d = tmp_path / "sub"
+        d.mkdir()
+        child = d / "f.txt"
+        child.write_text("FAILING EVIDENCE")
+        mode = d.stat().st_mode & 0o777
+        d.chmod(0o400)                 # readable, NOT searchable
+        try:
+            # The premise: scandir succeeds, so the listability probe passes.
+            with os.scandir(d):
+                pass
+            with pytest.raises(PermissionError):
+                _entry_kind(child)
+        finally:
+            d.chmod(mode)
+
+    def test_it_classifies_the_ordinary_cases(self, tmp_path):
+        from score import _entry_kind
+        (tmp_path / "d").mkdir()
+        (tmp_path / "f").write_text("x")
+        os.symlink(tmp_path / "f", tmp_path / "link")
+        assert _entry_kind(tmp_path / "d") == "dir"
+        assert _entry_kind(tmp_path / "f") == "file"
+        # lstat, not stat: a link is classified as itself, and the callers
+        # skip links before asking.
+        assert _entry_kind(tmp_path / "link") == "other"

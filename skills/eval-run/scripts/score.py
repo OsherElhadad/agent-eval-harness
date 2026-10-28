@@ -16,6 +16,7 @@ import agent_eval._bootstrap  # noqa: F401 — auto-activate venv
 import argparse
 import ast
 import copy
+import functools
 import importlib
 import json
 import logging
@@ -24,6 +25,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import textwrap
@@ -76,6 +78,40 @@ def _resolve_under(root: Path, candidate: Path) -> Path:
     if not resolved.is_relative_to(root.resolve()):
         raise ValueError(f"Path escapes root directory: {candidate}")
     return resolved
+
+
+def _entry_kind(path: Path) -> str:
+    """``"dir"`` | ``"file"`` | ``"other"``, raising on a denied stat.
+
+    `Path.is_dir()` / `is_file()` answer False for anything they cannot
+    stat, and whether a denied stat counts as "cannot" is a pathlib policy
+    that has changed across versions: on 3.11-3.13 `EACCES` propagates, and
+    it is reported to be swallowed on 3.14. A readable-but-not-searchable
+    directory (mode 0400) lists its names but denies stat on the children,
+    so under the swallowing policy those children would be classified
+    `other` and dropped without anything being recorded. Stat explicitly and
+    let the error out, so the behaviour does not depend on the interpreter.
+    """
+    st = os.stat(path, follow_symlinks=False)
+    if stat.S_ISDIR(st.st_mode):
+        return "dir"
+    if stat.S_ISREG(st.st_mode):
+        return "file"
+    return "other"
+
+
+def _require_listable(directory: Path) -> None:
+    """Raise `OSError` if `directory` cannot be opened for listing.
+
+    `Path.rglob` swallows a directory it cannot open: it yields the entry and
+    nothing beneath it, and raises nothing. An unreadable FILE at least fails
+    loudly, so `chmod 000` on a sub-directory was the quieter way to keep an
+    artifact out of the record — the case scored normally over what was left.
+    The output trees are agent-produced, so that has to fail rather than
+    silently shrink what the judge grades.
+    """
+    with os.scandir(directory):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +248,37 @@ def _extract_verifiable_evidence(record):
 _SKIP_MODIFIED_PREFIXES = (".work", "subagents", "hooks")
 
 
+def _is_harness_namespace(rel: str, prefixes=_SKIP_MODIFIED_PREFIXES) -> bool:
+    """True when ``rel`` — a path RELATIVE TO ``_modified/`` — is inside one of
+    the harness's own namespaces (``prefixes``, by default
+    `_SKIP_MODIFIED_PREFIXES`).
+
+    The single statement of the rule. Every walk that can reach ``_modified``
+    (the record's ``_modified`` walk, its declared-output walk, and staging)
+    asks this rather than testing the prefixes itself, so they cannot drift.
+    Staging passes the ``exclude`` of the source it is copying, so a source
+    with a different exclusion gets its own rule through the same predicate.
+
+    Decided from the PATH alone — it must never touch the filesystem, so that
+    pruning cannot fail on a directory the walk was never going to read. Every
+    caller asks it BEFORE any stat, listing or resolve of the entry.
+    """
+    return rel.startswith(prefixes)
+
+
+def _in_harness_namespace(case_rel) -> bool:
+    """`_is_harness_namespace` for a path relative to the CASE directory.
+
+    A declared output may be ``_modified`` itself, something under it, or an
+    ancestor of it (``"."``), so a walk arrives at ``_modified/...`` through
+    any of them. Normalising to the path under ``_modified`` here is what makes
+    the pruning independent of which declaration led there.
+    """
+    parts = Path(os.path.normpath(str(case_rel))).parts
+    return (len(parts) > 1 and parts[0] == "_modified"
+            and _is_harness_namespace(os.sep.join(parts[1:])))
+
+
 def load_case_record(case_dir, config, run_id=None, runs_dir=None,
                      load_files=True):
     """Load all outputs, execution metadata, and traces for a case.
@@ -275,14 +342,35 @@ def load_case_record(case_dir, config, run_id=None, runs_dir=None,
         if not output.path:
             continue
         out_path = output.path
+        # Decide from the PATH, before anything touches the filesystem: a
+        # declared output inside a harness namespace (`_modified/.work/x`)
+        # is not judge evidence, and `exists()` / `resolve()` on it would
+        # stat through a directory that may be unreadable. See
+        # `_is_harness_namespace`.
+        if _in_harness_namespace(out_path):
+            continue
         artifact_dir = case_dir / out_path
         if not artifact_dir.exists():
             continue
         _resolve_under(case_dir, artifact_dir)
         if not load_files:
             continue
+        _require_listable(artifact_dir)
         for f in sorted(artifact_dir.rglob("*")):
-            if not f.is_file() or f.is_symlink():
+            # Prune the harness's namespaces BEFORE `is_symlink()` (an
+            # lstat) or anything else that stats the entry: whichever
+            # declared output (`_modified`, or `.`) led here, a child of a
+            # readable-but-not-searchable `.work` (mode 0400) is listed but
+            # its stat is denied. The decision needs only the path.
+            if _in_harness_namespace(f.relative_to(case_dir)):
+                continue
+            if f.is_symlink():
+                continue
+            kind = _entry_kind(f)
+            if kind == "dir":
+                _require_listable(f)
+                continue
+            if kind != "file":
                 continue
             _resolve_under(case_dir, f)
             rel = str(f.relative_to(case_dir))
@@ -294,6 +382,8 @@ def load_case_record(case_dir, config, run_id=None, runs_dir=None,
     # Convenience keys for the first file in each path output dir
     for output in config.outputs if load_files else ():
         if not output.path:
+            continue
+        if _in_harness_namespace(output.path):
             continue
         artifact_dir = case_dir / output.path
         if not artifact_dir.exists():
@@ -312,13 +402,34 @@ def load_case_record(case_dir, config, run_id=None, runs_dir=None,
     modified_dir = case_dir / "_modified"
     if load_files and modified_dir.exists():
         modified = {}
+        # Containment BEFORE listing. `_modified` is agent-produced, and
+        # `exists()` follows a symlink — so a `_modified` pointing out of the
+        # case would otherwise have its target enumerated (by this probe, and
+        # by `rglob` after it) before any boundary check ran. The declared
+        # output dirs above are resolved on the way in; this one was not.
+        _resolve_under(case_dir, modified_dir)
+        _require_listable(modified_dir)
         for f in sorted(modified_dir.rglob("*")):
-            if not f.is_file() or f.is_symlink():
+            rel = str(f.relative_to(modified_dir))
+            # Prune the harness's own namespaces BEFORE `is_symlink()` (an
+            # lstat), classifying or probing. They are not judge evidence, so
+            # an unreadable directory under `.work`/`hooks`/`subagents` — or
+            # a readable-but-not-searchable one (mode 0400), whose children
+            # are listed but cannot be stat-ed — must not fail the case:
+            # charging every judge with incomplete evidence over something
+            # nothing was going to grade blocks a run that lost nothing.
+            if _is_harness_namespace(rel):
+                continue
+            if f.is_symlink():
+                continue
+            kind = _entry_kind(f)
+            if kind == "dir":
+                _resolve_under(case_dir, f)
+                _require_listable(f)
+                continue
+            if kind != "file":
                 continue
             _resolve_under(case_dir, f)
-            rel = str(f.relative_to(modified_dir))
-            if rel.startswith(_SKIP_MODIFIED_PREFIXES):
-                continue
             try:
                 content = f.read_text()
                 record["files"][f"_modified/{rel}"] = content
@@ -3380,8 +3491,28 @@ def score_cases(judges, case_dirs, config, run_id=None, samples_override=None):
 
     def _score_case(case_dir):
         case_id = case_dir.name
-        record = load_case_record(case_dir, config, run_id=run_id,
-                                  load_files=load_files)
+        try:
+            record = load_case_record(case_dir, config, run_id=run_id,
+                                      load_files=load_files)
+        except Exception as e:
+            # Reading the case directory precedes every judge, so ANY failure
+            # here withholds evidence from all of them. `load_case_record`
+            # tolerates an UNDECODABLE file (recorded as binary) but not an
+            # UNREADABLE one, and propagating is right — swallowing it would
+            # drop the artifact silently. What must not happen is it arriving
+            # as a plain error, because `incomplete_cases` is what stops a
+            # score threshold passing on the remaining cases.
+            #
+            # Deliberately not a list of exception types. `OSError` alone
+            # would have been the same enumeration bug one layer down: a
+            # declared output dir symlinked out of the case raises ValueError
+            # from `_resolve_under`, and a file with invalid UTF-8 raises
+            # UnicodeDecodeError past the `(YAMLError, OSError)` handlers —
+            # both of them a case the judge cannot grade, neither an OSError.
+            # The SCOPE is what keeps this honest: the guard wraps this one
+            # call, so a failure anywhere later in the case stays an ordinary
+            # error and `max_error_rate` keeps pricing it.
+            raise CaseEvidenceUnavailable(case_dir, e) from e
         case_results = {}
         for name, scorer, condition, judge_type, judge_samples in judges:
             # Step-scoped judges see that step's trace; others the whole case.
@@ -3514,9 +3645,25 @@ def score_cases(judges, case_dirs, config, run_id=None, samples_override=None):
             except Exception as e:
                 case_dir = futures[future]
                 case_id = case_dir.name
-                case_results = {name: {"value": None, "error": str(e),
-                                       "judge_type": jt}
-                                for name, _, _, jt, _ in judges}
+                # Invariant, shared with the `StagingIncomplete` handler in the
+                # agent-judge scorer: a case where a judge did not see material
+                # it should have is counted in `incomplete_cases`, whichever
+                # step lost it. This loss precedes every judge, so it is
+                # recorded against all of them. Only an evidence failure is
+                # marked — an unrelated crash stays an ordinary error, the same
+                # line `agent.context` already draws.
+                lost = (e.skips
+                        if isinstance(e, CaseEvidenceUnavailable) else None)
+                case_results = {}
+                for name, _, _, jt, _ in judges:
+                    result = {"value": None, "error": str(e), "judge_type": jt}
+                    if lost:
+                        # Summarised per judge, not once and shared: `yaml.dump`
+                        # turns a repeated object into an `&id001`/`*id001`
+                        # anchor pair, and `summary.yaml` is read by things
+                        # other than PyYAML.
+                        result["staging_skips"] = _summarize_staging_skips(lost)
+                    case_results[name] = result
                 print(f"  [{completed}/{len(case_dirs)}] {case_id} ERROR: {e}",
                       file=sys.stderr, flush=True)
             per_case[case_id] = case_results
@@ -4164,6 +4311,34 @@ def _format_staging_problems(problems, limit=10):
     return f"{len(problems)} {noun}: {detail}{more}"
 
 
+class CaseEvidenceUnavailable(RuntimeError):
+    """A case's record could not be read, so no judge saw its material.
+
+    The third way a judge ends up grading nothing, after a reported skip and
+    `StagingIncomplete` — and the only one that happens BEFORE staging, while
+    `load_case_record` reads the case directory.
+
+    Mostly that means the declared output trees, which are read only when some
+    judge needs file contents (`_judges_read_files`); a run of nothing but
+    agent judges skips them, which is why hardening staging alone left this
+    open and why the tests for it need a mixed judge set. Not every read is
+    gated that way, though: the `steps/` listing of a multi-step case is not,
+    so an all-agent-judge run can still arrive here.
+
+    The case directory is agent-produced, so `chmod 000` on an unfavourable
+    artifact has to count as withheld evidence rather than as an ordinary
+    error: errors leave the `min_pass_rate` denominator, and a score over the
+    survivors would pass. ``skips`` carries that in the shape
+    `_summarize_staging_skips` consumes, so the loss is recorded exactly as a
+    staging loss is.
+    """
+
+    def __init__(self, case_dir, cause):
+        reason = f"{_CONTENT_LOST}: {cause}"
+        super().__init__(f"{case_dir}: {reason}")
+        self.skips = [(str(case_dir), reason)]
+
+
 class StagingIncomplete(RuntimeError):
     """Staging could not copy gradeable content (see `_report_staging_problems`).
 
@@ -4260,14 +4435,30 @@ def _stage_case_outputs(workspace, case_dir, output_dirs, selected):
             continue
         # Containment: an output path that resolves outside the case dir is
         # never staged (CWE-22); load_case_record rejects it the same way.
-        src = _resolve_under(case_dir, src)
+        try:
+            src = _resolve_under(case_dir, src)
+        except ValueError as e:
+            # Report it as LOST rather than raising straight out. Raising made
+            # it an ordinary judge error, so the case left the denominator and
+            # a score threshold passed on the survivors — the escape this gate
+            # exists to close, reached by symlinking `_modified` out of the
+            # case. The reason deliberately carries no skip prefix, so
+            # `_report_staging_problems` classifies it as lost content and the
+            # caller counts the case. Note the whole declared tree is gone,
+            # which is why this is not one of the benign "resolves outside"
+            # skips that apply to a single entry inside a tree.
+            problems.append((str(src), str(e)))
+            continue
         if rel == ".":
             dest, skip = workspace, _skip_top
         else:
             if _skip_top(rel.split(os.sep, 1)[0]):
                 continue
             dest = workspace / rel
-            skip = (lambda name, ex=exclude: name.startswith(ex)) if exclude else None
+            # Parameterised by this source's `exclude`, so a source with a
+            # different exclusion gets its own prefixes, not `_modified`'s.
+            skip = (functools.partial(_is_harness_namespace, prefixes=exclude)
+                    if exclude else None)
         problems.extend(_copy_tree_dereferenced(src, dest, str(src), (),
                                                 skip=skip, budget=budget,
                                                 untrusted=True))
@@ -4637,6 +4828,10 @@ class PairwiseResult:
     pref_ab: Optional[str] = None
     pref_ba: Optional[str] = None
     error: Optional[str] = None
+    # The comparison never happened because a side's record could not be
+    # built — distinct from a judge that ran and failed. Same condition
+    # `incomplete_cases` records for scoring judges.
+    evidence_lost: bool = False
     reasoning_ab: Optional[dict] = None
     reasoning_ba: Optional[dict] = None
     # Usage records of the two judge calls (spec 014 side channel).
@@ -4710,8 +4905,17 @@ def compare_runs(run_a_dir, run_b_dir, config, case_ids,
                                                   "judge_verdict", "auto") or "auto")
 
     def _compare_case(case_id):
-        record_a = load_case_record(run_a_dir / "cases" / case_id, config)
-        record_b = load_case_record(run_b_dir / "cases" / case_id, config)
+        # `load_case_record` raises when a side's case directory cannot be
+        # read (an unreadable file, an unlistable directory, a declared
+        # output resolving outside the case). Unguarded, one such case took
+        # the whole pairwise invocation down with a traceback and recorded
+        # nothing — the comparison is simply unavailable for that case.
+        try:
+            record_a = load_case_record(run_a_dir / "cases" / case_id, config)
+            record_b = load_case_record(run_b_dir / "cases" / case_id, config)
+        except Exception as e:
+            return PairwiseResult(case_id=case_id, evidence_lost=True,
+                                  error=f"{_CONTENT_LOST}: {e}")
 
         # Render the FULL artifact set per side (task + review + feasibility +
         # auto-fix reports, etc.) — not just the first file. Using _first_content
@@ -4761,7 +4965,10 @@ def compare_runs(run_a_dir, run_b_dir, config, case_ids,
     with ThreadPoolExecutor(max_workers=parallelism) as pool:
         futures = {pool.submit(_compare_case, cid): cid for cid in case_ids}
         for future in as_completed(futures):
-            r = future.result()
+            try:
+                r = future.result()
+            except Exception as e:                      # pragma: no cover
+                r = PairwiseResult(case_id=futures[future], error=str(e))
             results.append(r)
             with lock:
                 completed += 1
@@ -4779,6 +4986,11 @@ def compare_runs(run_a_dir, run_b_dir, config, case_ids,
         "cases_compared": len(results),
         "wins_a": wins_a, "wins_b": wins_b,
         "ties": ties, "errors": errors,
+        # Of those errors, the ones where no comparison was possible because
+        # a side's evidence could not be read. Reported rather than gated:
+        # `min_win_rate` reads a `win_rate` nothing in the harness writes
+        # yet, so there is no live gate to hang this on (see #281).
+        "incomplete_cases": sum(1 for r in results if r.evidence_lost),
         "per_case": [{"case_id": r.case_id, "winner": r.winner, "error": r.error,
                       "reasoning": r.reasoning}
                      for r in results],
@@ -5277,7 +5489,20 @@ def detect_regressions(current_results, thresholds, baseline_results=None):
         # survivors — which is the escape, one `ln` wide. No score threshold
         # is satisfiable while the graded skill omitted evidence.
         _SCORE_KEYS = ("min_mean", "min_pass_rate", "min_win_rate")
-        if incomplete and any(k in threshold for k in _SCORE_KEYS):
+        # A baseline comparison gates on a score just as a score key does, so
+        # enumerating the keys alone left the same escape one door along: with
+        # `max_error_rate` as the only threshold, an incomplete run whose
+        # survivors match the baseline passed. The test mirrors the comparison
+        # below, so the guard fires only where a number is really compared.
+        baseline = (baseline_results or {}).get(judge_name) or {}
+        # The baseline arm does not require the CURRENT value to exist. When
+        # every case is incomplete there is no `mean`/`pass_rate` left to
+        # compare, so requiring both sides made the guard fail open exactly
+        # when the run was most broken: a tolerant `max_error_rate` plus a
+        # baseline reported nothing at all on a run that measured nothing.
+        gates_on_a_score = any(k in threshold for k in _SCORE_KEYS) or any(
+            baseline.get(k) is not None for k in ("mean", "pass_rate"))
+        if incomplete and gates_on_a_score:
             scored = current.get("scored_cases") or 0
             errored = current.get("errored_cases") or 0
             regressions.append(Regression(
@@ -5307,7 +5532,6 @@ def detect_regressions(current_results, thresholds, baseline_results=None):
                 regressions.append(Regression(judge_name, "win_rate",
                                               f">= {threshold['min_win_rate']}", str(win_rate)))
         if baseline_results:
-            baseline = baseline_results.get(judge_name)
             if baseline and current:
                 for key in ("mean", "pass_rate"):
                     curr_val = current.get(key)
