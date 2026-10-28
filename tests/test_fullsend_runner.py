@@ -36,6 +36,15 @@ FAKE_FULLSEND = textwrap.dedent('''\
 
     argv = sys.argv[1:]
 
+    # Like the real CLI: no `version` subcommand (unknown-command error, exit
+    # 1); the version is only available as `--version`.
+    if argv == ["version"]:
+        print('Error: unknown command "version" for "fullsend"', file=sys.stderr)
+        sys.exit(1)
+    if argv == ["--version"]:
+        print("fullsend version 0.49.0")
+        sys.exit(0)
+
     def flag(name):
         return argv[argv.index(name) + 1]
 
@@ -72,6 +81,12 @@ FAKE_FULLSEND = textwrap.dedent('''\
     Path(os.environ["FAKE_FULLSEND_RECORD"]).write_text(json.dumps(record))
 
     print("-> Running agent: " + argv[1])
+    if not os.environ.get("FAKE_FULLSEND_NO_IMAGE"):
+        # fullsend prints the sandbox image it resolved (after any
+        # FULLSEND_SANDBOX_IMAGE override) and the sandbox architecture.
+        print("    Image: " + os.environ.get(
+            "FAKE_FULLSEND_IMAGE", "ghcr.io/fullsend-ai/sandbox@sha256:" + "a" * 64))
+        print("  Arch: arm64")
     print("fullsend console stderr", file=sys.stderr)
     if os.environ.get("FAKE_FULLSEND_SLEEP"):
         time.sleep(float(os.environ["FAKE_FULLSEND_SLEEP"]))
@@ -173,7 +188,8 @@ def fake_fullsend(fake_bin, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_FULLSEND_RECORD", str(record))
     for var in ("FAKE_FULLSEND_SLEEP", "FAKE_FULLSEND_EXIT", "FAKE_FULLSEND_ARTIFACTS",
                 "FAKE_FULLSEND_NO_RUN", "FAKE_FULLSEND_HANG_AFTER_RUN",
-                "FAKE_FULLSEND_ITERATIONS"):
+                "FAKE_FULLSEND_ITERATIONS",
+                "FAKE_FULLSEND_NO_IMAGE", "FAKE_FULLSEND_IMAGE"):
         monkeypatch.delenv(var, raising=False)
     return record
 
@@ -1518,6 +1534,15 @@ def test_execute_py_batch_end_to_end(tmp_path, fake_bin):
     assert run_result["cost_usd"] == 0.42
     assert run_result["num_turns"] == 7
     assert run_result["model"] == "claude-opus-4-6"
+    params = run_result["eval_params"]
+    assert params["fullsend_agent"] == "rfe-creator-eval"
+    assert params["fullsend_version"] == "0.49.0"
+    assert params["sandbox_image"] == "ghcr.io/fullsend-ai/sandbox@sha256:" + "a" * 64
+    assert params["sandbox_image_source"] == "fullsend-output"
+    assert params["sandbox_arch"] == "arm64"
+    # Keys always present for fullsend, null when the tool/checkout is absent.
+    assert "openshell_version" in params
+    assert "agent_harness_commit" in params
     (run_dir,) = _run_dirs(workspace)
     stream = (run_dir / "iteration-1" / "output.jsonl").read_text()
     assert (output_dir / "stdout.log").read_text() == stream
@@ -1530,6 +1555,516 @@ def test_execute_py_batch_end_to_end(tmp_path, fake_bin):
     for n, case_id in enumerate(("case-001", "case-002"), start=1):
         report = output_dir / "cases" / case_id / "artifacts" / f"report-{n}.md"
         assert report.read_text() == f"report {n}"
+
+
+# ── Run provenance ───────────────────────────────────────────────────
+
+_IMAGE = "ghcr.io/fullsend-ai/sandbox@sha256:" + "a" * 64
+
+
+def _git_init(path):
+    git = ["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@example.com",
+           "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(git + ["add", "-A"], check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "init", "--allow-empty"], check=True)
+    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _no_openshell(monkeypatch):
+    real_which = fullsend_mod.shutil.which
+    monkeypatch.setattr(fullsend_mod.shutil, "which",
+                        lambda name, *a, **k: None if name == "openshell"
+                        else real_which(name, *a, **k))
+
+
+class TestParseSandboxImage:
+    def test_image_and_arch_lines(self):
+        console = f"-> Running agent: a\n  Image: {_IMAGE}\n  Arch: arm64\n"
+        assert fullsend_mod.parse_sandbox_image(console) == (_IMAGE, "arm64")
+
+    def test_arch_on_the_image_line_and_ansi_codes(self):
+        console = f"\x1b[32m✓\x1b[0m Image: {_IMAGE} (amd64)\n"
+        assert fullsend_mod.parse_sandbox_image(console) == (_IMAGE, "amd64")
+
+    def test_first_image_line_wins(self):
+        console = f"Image: {_IMAGE}\nImage: other:latest\n"
+        assert fullsend_mod.parse_sandbox_image(console)[0] == _IMAGE
+
+    def test_absent(self):
+        console = ("Image override via FULLSEND_SANDBOX_IMAGE: a -> b\n"
+                   "WARNING: FULLSEND_SANDBOX_ARCH=\"x\" is not a supported "
+                   "architecture (amd64, arm64), using host arch amd64\n")
+        assert fullsend_mod.parse_sandbox_image(console) == (None, None)
+
+
+class TestProbeVersion:
+    def test_falls_back_to_version_flag(self, fake_bin, fake_fullsend):
+        """The real CLI has no `version` subcommand; `--version` answers
+        `fullsend version <v>`."""
+        assert fullsend_mod.probe_version("fullsend", ("fullsend",)) == "0.49.0"
+
+    def test_version_subcommand_is_an_unknown_command(self, fake_bin, fake_fullsend):
+        proc = subprocess.run(["fullsend", "version"], capture_output=True, text=True,
+                              check=False)
+        assert proc.returncode == 1
+        assert "unknown command" in proc.stderr
+
+    def test_missing_binary_is_none(self, tmp_path):
+        assert fullsend_mod.probe_version(str(tmp_path / "nope"), ("fullsend",)) is None
+        assert fullsend_mod.probe_version(None) is None
+
+
+class TestProvenance:
+    def test_fields_from_console_output(self, tmp_path, fake_fullsend, monkeypatch):
+        _no_openshell(monkeypatch)
+        runner = _runner(tmp_path)
+        ws = _workspace(tmp_path)
+        result = runner.execute("rfe.speedrun", "", ws, "opus")
+        prov = runner.provenance([result.stderr])
+        assert set(prov) == set(fullsend_mod.PROVENANCE_KEYS)
+        assert prov["fullsend_agent"] == "rfe-creator-eval"
+        assert prov["fullsend_version"] == "0.49.0"
+        assert prov["sandbox_image"] == _IMAGE
+        assert prov["sandbox_image_source"] == "fullsend-output"
+        assert prov["sandbox_arch"] == "arm64"
+        assert prov["openshell_version"] is None
+
+    def test_console_image_overrides_harness_file(self, tmp_path, fake_fullsend,
+                                                  monkeypatch):
+        """An Image: line (e.g. after FULLSEND_SANDBOX_IMAGE) beats the pin."""
+        runner = _runner(tmp_path)
+        harness = Path(runner._fullsend_dir) / "harness"
+        harness.mkdir()
+        (harness / "rfe-creator-eval.yaml").write_text("image: pinned:1\n")
+        monkeypatch.setenv("FAKE_FULLSEND_IMAGE", "override:2")
+        result = runner.execute("rfe.speedrun", "", _workspace(tmp_path), "opus")
+        prov = runner.provenance([result.stderr])
+        assert prov["sandbox_image"] == "override:2"
+        assert prov["sandbox_image_source"] == "fullsend-output"
+
+    def test_harness_file_fallback(self, tmp_path, fake_fullsend, monkeypatch, capsys):
+        runner = _runner(tmp_path)
+        harness = Path(runner._fullsend_dir) / "harness"
+        harness.mkdir()
+        (harness / "rfe-creator-eval.yaml").write_text(
+            "agent: agents/rfe.md\nimage: ghcr.io/x/sandbox@sha256:" + "b" * 64 + "\n")
+        monkeypatch.setenv("FAKE_FULLSEND_NO_IMAGE", "1")
+        result = runner.execute("rfe.speedrun", "", _workspace(tmp_path), "opus")
+        prov = runner.provenance([result.stderr])
+        assert prov["sandbox_image"] == "ghcr.io/x/sandbox@sha256:" + "b" * 64
+        assert prov["sandbox_image_source"] == "harness-file"
+        assert prov["sandbox_arch"] is None
+        assert "harness file" in capsys.readouterr().out
+
+    def test_registered_source_harness_file_without_harness_dir(
+            self, tmp_path, fake_fullsend, monkeypatch):
+        """A per-repo install registers the agent under agents[].source and has
+        no harness/ directory; the image comes from that file."""
+        monkeypatch.setenv("FAKE_FULLSEND_NO_IMAGE", "1")
+        runner = _runner(tmp_path)
+        fs_dir = Path(runner._fullsend_dir)
+        (fs_dir / "sub").mkdir()
+        (fs_dir / "sub" / "agent.yaml").write_text(
+            "agent: agents/a.md\nimage: ghcr.io/x/sandbox@sha256:" + "c" * 64 + "\n")
+        (fs_dir / "config.yaml").write_text(yaml.dump({"agents": [
+            {"name": "code", "model": "opus"},
+            {"source": "sub/agent.yaml#v1", "name": "Rfe-Creator-Eval"}]}))
+        assert not (fs_dir / "harness").exists()
+        result = runner.execute("rfe.speedrun", "", _workspace(tmp_path), "opus")
+        assert "Image:" not in result.stderr
+        prov = runner.provenance([result.stderr])
+        assert prov["sandbox_image"] == "ghcr.io/x/sandbox@sha256:" + "c" * 64
+        assert prov["sandbox_image_source"] == "harness-file"
+
+    def test_registered_source_matches_stem_and_last_enabled_entry(self, tmp_path):
+        fs_dir = Path(_runner(tmp_path)._fullsend_dir)
+        for name, image in (("first", "one:1"), ("second", "two:2"), ("third", "three:3")):
+            (fs_dir / name).mkdir()
+            (fs_dir / name / "rfe-creator-eval.yaml").write_text(f"image: {image}\n")
+        (fs_dir / "config.yaml").write_text(yaml.dump({"agents": [
+            {"source": "first/rfe-creator-eval.yaml"},
+            {"source": "second/RFE-Creator-Eval.yaml"},
+            {"source": "third/rfe-creator-eval.yaml", "enabled": False}]}))
+        (fs_dir / "second" / "RFE-Creator-Eval.yaml").write_text("image: two:2\n")
+        assert fullsend_mod.harness_file_image(fs_dir, "rfe-creator-eval") == "two:2"
+
+    @pytest.mark.parametrize("entry", [
+        {"source": "https://example.com/org/repo/rfe-creator-eval.yaml"},
+        {"name": "rfe-creator-eval", "model": "opus"},
+        {"source": "../outside/rfe-creator-eval.yaml"},
+        {"source": "/abs/rfe-creator-eval.yaml"},
+    ])
+    def test_url_override_only_and_escaping_entries_have_no_image(
+            self, tmp_path, entry):
+        """A matching entry decides the answer: harness/<agent>.yaml is not
+        consulted when fullsend would not load it."""
+        fs_dir = Path(_runner(tmp_path)._fullsend_dir)
+        (fs_dir / "harness").mkdir()
+        (fs_dir / "harness" / "rfe-creator-eval.yaml").write_text("image: pinned:1\n")
+        (fs_dir.parent / "outside").mkdir()
+        (fs_dir.parent / "outside" / "rfe-creator-eval.yaml").write_text("image: out:1\n")
+        (fs_dir / "config.yaml").write_text(yaml.dump({"agents": [entry]}))
+        assert fullsend_mod.harness_file_image(fs_dir, "rfe-creator-eval") is None
+
+    def test_unregistered_agent_falls_back_to_harness_dir(self, tmp_path):
+        fs_dir = Path(_runner(tmp_path)._fullsend_dir)
+        (fs_dir / "harness").mkdir()
+        (fs_dir / "harness" / "rfe-creator-eval.yaml").write_text("image: pinned:1\n")
+        (fs_dir / "config.yaml").write_text(yaml.dump({"agents": [{"name": "code"}]}))
+        assert fullsend_mod.harness_file_image(fs_dir, "rfe-creator-eval") == "pinned:1"
+
+    def test_config_yaml_symlinked_outside_is_not_read(self, tmp_path):
+        """config.yaml that resolves outside fullsend_dir is ignored like an
+        escaping source: the harness/ fallback answers instead."""
+        fs_dir = Path(_runner(tmp_path)._fullsend_dir)
+        (fs_dir / "harness").mkdir()
+        (fs_dir / "harness" / "rfe-creator-eval.yaml").write_text("image: pinned:1\n")
+        (fs_dir / "sub").mkdir()
+        (fs_dir / "sub" / "agent.yaml").write_text("image: registered:1\n")
+        outside = tmp_path / "outside-config.yaml"
+        outside.write_text(yaml.dump({"agents": [
+            {"name": "rfe-creator-eval", "source": "sub/agent.yaml"}]}))
+        (fs_dir / "config.yaml").symlink_to(outside)
+        assert fullsend_mod.harness_file_image(fs_dir, "rfe-creator-eval") == "pinned:1"
+
+    @pytest.mark.parametrize("suffix", [".yaml", ".yml"])
+    def test_legacy_harness_file_symlinked_outside_is_not_read(self, tmp_path, suffix):
+        fs_dir = Path(_runner(tmp_path)._fullsend_dir)
+        (fs_dir / "harness").mkdir()
+        outside = tmp_path / "outside-harness.yaml"
+        outside.write_text("image: out:1\n")
+        (fs_dir / "harness" / f"rfe-creator-eval{suffix}").symlink_to(outside)
+        assert fullsend_mod.harness_file_image(fs_dir, "rfe-creator-eval") is None
+
+    def test_legacy_harness_file_symlinked_inside_is_read(self, tmp_path):
+        fs_dir = Path(_runner(tmp_path)._fullsend_dir)
+        (fs_dir / "harness").mkdir()
+        (fs_dir / "shared.yaml").write_text("image: shared:1\n")
+        (fs_dir / "harness" / "rfe-creator-eval.yaml").symlink_to(fs_dir / "shared.yaml")
+        assert fullsend_mod.harness_file_image(fs_dir, "rfe-creator-eval") == "shared:1"
+
+    @pytest.mark.parametrize("raises", [False, True], ids=["real-loop", "resolve-raises"])
+    def test_looping_symlink_in_fullsend_dir_nulls_only_the_image(
+            self, tmp_path, fake_fullsend, monkeypatch, capsys, raises):
+        """A self-referential symlink under fullsend_dir must not escape
+        provenance(): only sandbox_image is null; version fields survive.
+        Path.resolve() raises RuntimeError/OSError on a loop before Python 3.13,
+        so ``resolve-raises`` forces that for every Python."""
+        _no_openshell(monkeypatch)
+        monkeypatch.setenv("FAKE_FULLSEND_NO_IMAGE", "1")
+        runner = _runner(tmp_path)
+        fs_dir = Path(runner._fullsend_dir)
+        loop = fs_dir / "loop.yaml"
+        loop.symlink_to(loop)
+        (fs_dir / "config.yaml").write_text(yaml.dump({"agents": [
+            {"name": "rfe-creator-eval", "source": "loop.yaml"}]}))
+        if raises:
+            real_resolve = Path.resolve
+
+            def resolve(self, *args, **kwargs):
+                if self.name == "loop.yaml":
+                    raise RuntimeError("Symlink loop from " + str(self))
+                return real_resolve(self, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "resolve", resolve)
+            assert fullsend_mod._contained(fs_dir, loop) is None
+        result = runner.execute("rfe.speedrun", "", _workspace(tmp_path), "opus")
+        assert "Image:" not in result.stderr
+        prov = runner.provenance([result.stderr])
+        assert prov["fullsend_agent"] == "rfe-creator-eval"
+        assert prov["fullsend_version"] == "0.49.0"
+        assert prov["sandbox_image"] is None
+        assert prov["sandbox_image_source"] is None
+        assert "sandbox_image is null" in capsys.readouterr().out
+
+    def test_looping_symlink_keeps_other_fields_in_run_params(
+            self, tmp_path, fake_fullsend, monkeypatch):
+        import execute
+        _no_openshell(monkeypatch)
+        monkeypatch.setenv("FAKE_FULLSEND_NO_IMAGE", "1")
+        runner = _runner(tmp_path)
+        fs_dir = Path(runner._fullsend_dir)
+        loop = fs_dir / "loop.yaml"
+        loop.symlink_to(loop)
+        (fs_dir / "config.yaml").write_text(yaml.dump({"agents": [
+            {"name": "rfe-creator-eval", "source": "loop.yaml"}]}))
+        real_resolve = Path.resolve
+
+        def resolve(self, *args, **kwargs):
+            if self.name == "loop.yaml":
+                raise RuntimeError("Symlink loop from " + str(self))
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+        params = execute._with_runner_provenance(
+            {"execution_mode": "case"}, runner, [])
+        assert params["execution_mode"] == "case"
+        assert params["fullsend_agent"] == "rfe-creator-eval"
+        assert params["fullsend_version"] == "0.49.0"
+        assert params["sandbox_image"] is None
+
+    def test_unparseable_yaml_warning_names_path_not_parser_text(
+            self, tmp_path, capsys):
+        fs_dir = Path(_runner(tmp_path)._fullsend_dir)
+        (fs_dir / "config.yaml").write_text(
+            "agents: [SECRET-VALUE\n  - {unclosed: \"SECRET-VALUE\n")
+        assert fullsend_mod.harness_file_image(fs_dir, "rfe-creator-eval") is None
+        out = capsys.readouterr().out
+        assert f"{fs_dir / 'config.yaml'} could not be parsed" in out
+        assert "SECRET-VALUE" not in out
+        assert "line" not in out.replace("could not be parsed", "")
+
+    def test_everything_missing_is_null_with_warnings(self, tmp_path, monkeypatch,
+                                                      capsys):
+        _no_openshell(monkeypatch)
+        runner = _runner(tmp_path, binary=str(tmp_path / "missing-fullsend"))
+        prov = runner.provenance(["no image here", None])
+        assert prov["fullsend_agent"] == "rfe-creator-eval"
+        for key in ("fullsend_version", "openshell_version", "sandbox_image",
+                    "sandbox_image_source", "sandbox_arch", "agent_harness_commit"):
+            assert prov[key] is None, key
+        out = capsys.readouterr().out
+        assert "openshell is not on PATH" in out
+        assert "not inside a git checkout" in out
+        assert "sandbox_image is null" in out
+
+    def test_openshell_version_and_harness_commit(self, tmp_path, monkeypatch):
+        bin_dir = tmp_path / "osbin"
+        bin_dir.mkdir()
+        openshell = bin_dir / "openshell"
+        openshell.write_text(f"#!{sys.executable}\nimport sys\n"
+                             "sys.exit(2) if sys.argv[1:] == ['version'] "
+                             "else print('openshell 0.0.36')\n")
+        openshell.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+        runner = _runner(tmp_path)
+        sha = _git_init(tmp_path / "project")
+        prov = runner.provenance([])
+        assert prov["openshell_version"] == "0.0.36"
+        assert prov["agent_harness_commit"] == sha
+
+
+class TestProvenanceUsesInvocationEnvironment:
+    def test_runner_env_path_selects_the_probed_installs(
+            self, tmp_path, fake_fullsend, monkeypatch):
+        """runner.env.PATH pins a different fullsend/OpenShell than the
+        caller's PATH; provenance records the pinned ones."""
+        pinned = tmp_path / "pinned"
+        pinned.mkdir()
+        for name, text in (("fullsend", "fullsend version 9.9.9"),
+                           ("openshell", "openshell 7.7.7")):
+            exe = pinned / name
+            exe.write_text(f"#!{sys.executable}\nimport sys\n"
+                           f"print({text!r}) if sys.argv[1:] == ['version'] "
+                           "else sys.exit(2)\n")
+            exe.chmod(0o755)
+        # The caller's PATH has the fake fullsend (0.49.0), not these installs.
+        runner = _runner(tmp_path, runner_env={"PATH": str(pinned)})
+        prov = runner.provenance([])
+        assert prov["fullsend_version"] == "9.9.9"
+        assert prov["openshell_version"] == "7.7.7"
+
+    def test_without_override_the_caller_path_is_used(self, tmp_path, fake_fullsend):
+        assert _runner(tmp_path).provenance([])["fullsend_version"] == "0.49.0"
+
+
+class TestCaseConsoleLogs:
+    def test_multi_step_case_collects_every_step_log(self, tmp_path):
+        """The case-root stderr.log holds only the final step; an earlier
+        fullsend step's Image: line (an override) must still be found."""
+        import execute
+        case_dir = tmp_path / "cases" / "case-001"
+        for step, text in (("a", f"Image: override:2\nArch: arm64\n"),
+                           ("b", "no image line here\n")):
+            (case_dir / "steps" / step).mkdir(parents=True)
+            (case_dir / "steps" / step / "stderr.log").write_text(text)
+        (case_dir / "stderr.log").write_text("no image line here\n")
+        texts = execute._case_console_logs(
+            tmp_path, {"case-001": {"steps": {"a": {}, "b": {}}}})
+        assert len(texts) == 2
+        assert fullsend_mod.parse_sandbox_image(texts[0]) == ("override:2", "arm64")
+
+    def test_single_step_case_reads_root_log(self, tmp_path):
+        import execute
+        case_dir = tmp_path / "cases" / "case-001"
+        case_dir.mkdir(parents=True)
+        (case_dir / "stderr.log").write_text("Image: x:1\n")
+        assert execute._case_console_logs(
+            tmp_path, {"case-001": {"exit_code": 0}}) == ["Image: x:1\n"]
+
+    def test_provenance_keeps_override_from_earlier_step(
+            self, tmp_path, fake_fullsend, monkeypatch):
+        import execute
+        case_dir = tmp_path / "out" / "cases" / "case-001"
+        for step, text in (("fs", "Image: override:2\n"), ("other", "plain\n")):
+            (case_dir / "steps" / step).mkdir(parents=True)
+            (case_dir / "steps" / step / "stderr.log").write_text(text)
+        (case_dir / "stderr.log").write_text("plain\n")
+        texts = execute._case_console_logs(
+            tmp_path / "out", {"case-001": {"steps": {"fs": {}, "other": {}}}})
+        prov = _runner(tmp_path).provenance(texts)
+        assert prov["sandbox_image"] == "override:2"
+        assert prov["sandbox_image_source"] == "fullsend-output"
+
+
+def test_execute_py_case_mode_records_provenance_in_report(tmp_path, fake_bin):
+    """A case-mode run writes the provenance fields into the run-level
+    run_result.json, and the report's run header shows them."""
+    project = tmp_path / "project"
+    for case_id in ("case-001", "case-002"):
+        (project / "cases" / case_id).mkdir(parents=True)
+        (project / "cases" / case_id / "input.yaml").write_text(
+            yaml.dump({"prompt": f"idea from {case_id}"}))
+    (project / ".claude" / "skills" / "rfe.create").mkdir(parents=True)
+    (project / ".claude" / "skills" / "rfe.create" / "SKILL.md").write_text("# s")
+    (project / ".fullsend").mkdir()
+    (project / ".fullsend" / "config.yaml").write_text("agents: []\n")
+    (project / "eval.yaml").write_text(yaml.dump({
+        "name": "fullsend-case",
+        "execution": {"mode": "case", "skill": "rfe.create",
+                      "arguments": "{prompt}"},
+        "runner": {"type": "fullsend", "agent": "rfe-creator-eval"},
+        "models": {"skill": "opus"},
+        "dataset": {"path": "cases", "schema": "Each case has a prompt"},
+        "outputs": [{"path": "artifacts", "schema": "Reports"}],
+    }))
+    sha = _git_init(project)
+
+    runs_dir = tmp_path / "runs"
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("_AGENT_EVAL_BOOTSTRAP_DONE", "FAKE_FULLSEND_EXIT",
+                        "FAKE_FULLSEND_SLEEP", "FAKE_FULLSEND_NO_IMAGE",
+                        "FAKE_FULLSEND_IMAGE")}
+    env.update({
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        "AGENT_EVAL_RUNS_DIR": str(runs_dir),
+        "FAKE_FULLSEND_RECORD": str(tmp_path / "record.json"),
+    })
+    ws_result = _run_script("workspace.py", ["--config", "eval.yaml", "--run-id", "r1"],
+                            cwd=project, env=env)
+    assert ws_result.returncode == 0, ws_result.stderr
+    workspace = next(Path(line.split(":", 1)[1].strip())
+                     for line in ws_result.stdout.splitlines()
+                     if line.startswith("WORKSPACE:"))
+    output_dir = runs_dir / "fullsend-case" / "r1"
+    output_dir.mkdir(parents=True)
+    exec_result = _run_script("execute.py", [
+        "--workspace", str(workspace), "--model", "opus",
+        "--output", str(output_dir), "--config", str(project / "eval.yaml"),
+        "--run-id", "r1",
+    ], cwd=project, env=env)
+    assert exec_result.returncode == 0, exec_result.stderr + exec_result.stdout
+
+    run_result = json.loads((output_dir / "run_result.json").read_text())
+    params = run_result["eval_params"]
+    assert params["fullsend_agent"] == "rfe-creator-eval"
+    assert params["fullsend_version"] == "0.49.0"
+    assert params["sandbox_image"] == _IMAGE
+    assert params["sandbox_image_source"] == "fullsend-output"
+    assert params["sandbox_arch"] == "arm64"
+    assert params["agent_harness_commit"] == sha
+    assert "openshell_version" in params
+    # Run-level only: per-case results do not carry the provenance.
+    for case in run_result["per_case"].values():
+        assert "sandbox_image" not in case
+
+    from report import _render_run_config
+    html = _render_run_config(run_result)
+    assert "<dt>fullsend Version</dt><dd>0.49.0</dd>" in html
+    assert f"<dt>Sandbox Image</dt><dd>{_IMAGE}</dd>" in html
+    assert "<dt>Sandbox Image Source</dt><dd>fullsend-output</dd>" in html
+    assert f"<dt>Agent Harness Commit</dt><dd>{sha}</dd>" in html
+    assert "<dt>fullsend Agent</dt><dd>rfe-creator-eval</dd>" in html
+    assert "<dt>OpenShell Version</dt>" in html
+
+
+class TestProvenanceNeverFailsTheRun:
+    class _Runner:
+        name = "fullsend"
+
+        def provenance(self, console_texts):
+            return {"fullsend_agent": "a", "texts": len(console_texts)}
+
+    def test_log_collection_failure_is_guarded(self, capsys):
+        import execute
+
+        def boom():
+            raise PermissionError("unsearchable case directory")
+
+        params = execute._with_runner_provenance({"execution_mode": "case"},
+                                                 self._Runner(), boom)
+        assert params == {"execution_mode": "case"}
+        assert "could not record fullsend provenance" in capsys.readouterr().err
+
+    @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
+                        reason="permission bits do not restrict root")
+    def test_unreadable_case_dir_still_yields_params(self, tmp_path):
+        import execute
+        case_dir = tmp_path / "cases" / "case-001"
+        case_dir.mkdir(parents=True)
+        (case_dir / "stderr.log").write_text("Image: x:1\n")
+        case_dir.chmod(0o000)
+        try:
+            params = execute._with_runner_provenance(
+                {"execution_mode": "case"}, self._Runner(),
+                lambda: execute._case_console_logs(tmp_path, {"case-001": {}}))
+        finally:
+            case_dir.chmod(0o755)
+        assert params["execution_mode"] == "case"
+
+    def test_log_collection_skipped_without_provenance(self):
+        import execute
+
+        class _Plain:
+            name = "claude-code"
+
+        def boom():
+            raise AssertionError("logs must not be collected")
+
+        assert execute._with_runner_provenance({"a": 1}, _Plain(), boom) == {"a": 1}
+
+    def test_callable_texts_are_passed_to_provenance(self):
+        import execute
+        params = execute._with_runner_provenance({}, self._Runner(), lambda: ["x", "y"])
+        assert params["texts"] == 2
+
+
+class TestProvenanceKeysOnRunnerAbstraction:
+    def test_only_fullsend_declares_keys(self):
+        assert EvalRunner.PROVENANCE_KEYS == ()
+        assert RUNNERS["fullsend"].PROVENANCE_KEYS == fullsend_mod.PROVENANCE_KEYS
+        for name, cls in RUNNERS.items():
+            if name != "fullsend":
+                assert cls.PROVENANCE_KEYS == (), name
+
+
+class TestOtherRunnersUnchanged:
+    def test_runner_without_provenance_adds_no_keys(self):
+        import execute
+
+        class _Runner:
+            name = "claude-code"
+
+        params = {"execution_mode": "case"}
+        merged = execute._with_runner_provenance(params, _Runner(), ["Image: x:1"])
+        assert merged == params
+        assert not set(fullsend_mod.PROVENANCE_KEYS) & set(merged)
+
+    def test_report_header_has_no_fullsend_rows(self):
+        from report import _render_run_config
+        html = _render_run_config({"model": "m", "agent": "claude-code",
+                                   "eval_params": {"execution_mode": "case"}})
+        for label in ("fullsend Version", "OpenShell Version", "Sandbox Image",
+                      "Agent Harness Commit", "fullsend Agent"):
+            assert label not in html
+
+    def test_report_header_shows_recorded_null_as_dash(self):
+        from report import _render_run_config
+        html = _render_run_config({"model": "m", "eval_params": {
+            "fullsend_agent": "a", "openshell_version": None}})
+        assert "<dt>OpenShell Version</dt><dd>—</dd>" in html
 
 
 # ── Review hardening ─────────────────────────────────────────────────

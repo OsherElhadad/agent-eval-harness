@@ -20,6 +20,10 @@ stream-json) as ``stdout`` so events, traces and reasoning judges work
 unchanged, and every iteration's subagent transcripts copied into
 ``<workspace>/subagents/``. ``agent-result.json`` and the other files under
 ``iteration-N/output/`` are fullsend's own export and are not read.
+
+:meth:`FullsendRunner.provenance` records what executed a run (fullsend and
+OpenShell versions, sandbox image, agent harness commit) for the run-level
+``run_result.json``; every field fails soft to ``None`` with a warning.
 """
 
 import json
@@ -34,6 +38,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+import yaml
 
 from agent_eval.config import resolve_env_value, workspace_source_roots
 from .base import EvalRunner, RunResult, terminate_process_group
@@ -63,9 +69,28 @@ _SUBAGENT_MODEL_VAR = "AGENT_EVAL_SUBAGENT_MODEL"
 _MAX_JSON_BYTES = 1_000_000
 _MAX_TELEMETRY_BYTES = 10_000_000
 
+# Run provenance (recorded in run_result.json eval_params and as MLflow params).
+PROVENANCE_KEYS = (
+    "fullsend_agent", "fullsend_version", "openshell_version", "sandbox_image",
+    "sandbox_image_source", "sandbox_arch", "agent_harness_commit",
+)
+_PROBE_TIMEOUT_S = 15
+_MAX_CONSOLE_SCAN_CHARS = 2_000_000
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# fullsend's console line naming the sandbox image it resolved, e.g.
+# ``Image: ghcr.io/org/sandbox@sha256:…`` (any leading bullet or indent).
+_IMAGE_LINE_RE = re.compile(r"^\W*Image:\s*(\S+)(.*)$")
+_ARCH_VALUES = r"(amd64|arm64|x86_64|aarch64)"
+_ARCH_LINE_RE = re.compile(
+    r"^\W*(?:Sandbox\s+)?Arch(?:itecture)?:\s*" + _ARCH_VALUES + r"\b", re.IGNORECASE)
+_ARCH_TOKEN_RE = re.compile(r"\b" + _ARCH_VALUES + r"\b")
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+
 
 class FullsendRunner(EvalRunner):
     """Runs a skill by invoking ``fullsend run <agent>`` on the workspace."""
+
+    PROVENANCE_KEYS = PROVENANCE_KEYS
 
     @classmethod
     def from_config(cls, config, *, log_prefix=None, **overrides):
@@ -136,6 +161,81 @@ class FullsendRunner(EvalRunner):
     @property
     def name(self) -> str:
         return "fullsend"
+
+    def provenance(self, console_texts=()) -> dict:
+        """What executed this run, for ``eval_params`` in ``run_result.json``.
+
+        ``console_texts`` are the captured console outputs (``RunResult.stderr``)
+        of the run's invocations. ``sandbox_image`` is the ``Image:`` line
+        fullsend printed there — authoritative, since ``FULLSEND_SANDBOX_IMAGE``
+        in the fullsend environment replaces the harness's pinned image — and
+        falls back to ``image:`` in the agent's harness file (registered in
+        ``<fullsend_dir>/config.yaml``; see :func:`harness_file_image`) only
+        when no console output has that line (``sandbox_image_source`` says
+        which). ``sandbox_arch`` is set only when fullsend printed it. Every
+        field is ``None`` when it cannot be determined, with a warning; this
+        never raises."""
+        # Probe with the environment fullsend itself runs in (execution.env and
+        # runner.env over the process environment), so a PATH override that
+        # selects a pinned fullsend/OpenShell install is the one recorded.
+        probe_env = os.environ.copy()
+        probe_env.update(self._env_entries("", None))
+        probe_env.pop("FULLSEND_TASK", None)
+
+        fullsend_version = probe_version(
+            self._binary, ("fullsend", Path(self._binary).name), env=probe_env)
+        if fullsend_version is None:
+            _warn_provenance(f"could not read the version of {self._binary!r} "
+                             f"(tried 'version' and '--version')")
+
+        openshell = shutil.which("openshell", path=probe_env.get("PATH"))
+        openshell_version = (
+            probe_version(openshell, ("openshell",), env=probe_env)
+            if openshell else None)
+        if openshell is None:
+            _warn_provenance("openshell is not on PATH; openshell_version is null")
+        elif openshell_version is None:
+            _warn_provenance(f"could not read the version of {openshell!r}")
+
+        image = arch = None
+        for text in console_texts or ():
+            if not isinstance(text, str) or not text:
+                continue
+            found, found_arch = parse_sandbox_image(text[:_MAX_CONSOLE_SCAN_CHARS])
+            if found and image is None:
+                image = found
+            elif found and found != image:
+                _warn_provenance(f"invocations of this run printed different sandbox "
+                                 f"images ({image} and {found}); recording the first")
+            if found_arch and arch is None:
+                arch = found_arch
+        source = "fullsend-output" if image else None
+        if image is None:
+            image = harness_file_image(self._fullsend_dir, self._agent)
+            if image:
+                source = "harness-file"
+                _warn_provenance(
+                    "fullsend printed no 'Image:' line; sandbox_image is read from "
+                    "the harness file and does not reflect a FULLSEND_SANDBOX_IMAGE "
+                    "override")
+            else:
+                _warn_provenance("no sandbox image in fullsend's console output or "
+                                 "the harness file; sandbox_image is null")
+
+        commit = git_head(self._fullsend_dir)
+        if commit is None:
+            _warn_provenance(f"{self._fullsend_dir} is not inside a git checkout; "
+                             f"agent_harness_commit is null")
+
+        return {
+            "fullsend_agent": self._agent,
+            "fullsend_version": fullsend_version,
+            "openshell_version": openshell_version,
+            "sandbox_image": image,
+            "sandbox_image_source": source,
+            "sandbox_arch": arch,
+            "agent_harness_commit": commit,
+        }
 
     def execute(
         self,
@@ -1089,3 +1189,187 @@ def _telemetry_denials(path: Path) -> list:
             denial["reason"] = reason
         denials.append(denial)
     return denials
+
+
+# ── Run provenance ───────────────────────────────────────────────────
+
+def _warn_provenance(message: str) -> None:
+    with _print_lock:
+        print(f"  WARNING: fullsend provenance: {message}", flush=True)
+
+
+def probe_version(binary: Optional[str], names=(), env=None) -> Optional[str]:
+    """``<binary> version``, falling back to ``<binary> --version``, run with
+    ``env`` (default: the process environment).
+
+    Returns the first non-empty output line with a leading tool name (any of
+    ``names``) and ``version`` word removed — ``fullsend version 212d119`` gives
+    ``212d119`` — or ``None`` when the binary is missing, both probes fail, or
+    they print nothing."""
+    if not binary:
+        return None
+    for args in (["version"], ["--version"]):
+        try:
+            proc = subprocess.run(
+                [binary, *args], capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=_PROBE_TIMEOUT_S, env=env)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        if proc.returncode != 0:
+            continue
+        version = _version_text(proc.stdout or proc.stderr or "", names)
+        if version:
+            return version
+    return None
+
+
+def _version_text(text: str, names=()) -> Optional[str]:
+    for raw in text.splitlines():
+        line = _ANSI_RE.sub("", raw).strip()
+        if not line:
+            continue
+        prefixes = "|".join(re.escape(n) for n in names if n)
+        if prefixes:
+            line = re.sub(rf"^(?:{prefixes})\s+", "", line, flags=re.IGNORECASE)
+        line = re.sub(r"^version\b[:\s]*", "", line, flags=re.IGNORECASE).strip()
+        return line[:200] or None
+    return None
+
+
+def parse_sandbox_image(console: str) -> tuple:
+    """``(image, arch)`` from fullsend's console output.
+
+    ``image`` is the value of the first ``Image:`` line; ``arch`` is an
+    architecture (amd64, arm64, …) printed on that line or on an
+    ``Arch:``/``Architecture:`` line. Either is ``None`` when absent."""
+    image = arch = None
+    for raw in console.splitlines():
+        line = _ANSI_RE.sub("", raw).strip()
+        if image is None:
+            m = _IMAGE_LINE_RE.match(line)
+            if m:
+                image = m.group(1)
+                token = _ARCH_TOKEN_RE.search(m.group(2))
+                if token and arch is None:
+                    arch = token.group(1)
+                continue
+        if arch is None:
+            m = _ARCH_LINE_RE.match(line)
+            if m:
+                arch = m.group(1).lower()
+        if image is not None and arch is not None:
+            break
+    return image, arch
+
+
+def _read_yaml_mapping(path: Path) -> Optional[dict]:
+    """The mapping in a YAML file, or ``None`` (with a warning when the file
+    exists but cannot be parsed) when it is absent, unreadable or not a mapping."""
+    if not path.is_file():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text())
+    except OSError:
+        _warn_provenance(f"{path} could not be read")
+        return None
+    except (ValueError, yaml.YAMLError):
+        # No parser text: it can quote the file's contents.
+        _warn_provenance(f"{path} could not be parsed")
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _image_of(path: Path) -> Optional[str]:
+    data = _read_yaml_mapping(path)
+    image = data.get("image") if data else None
+    return image.strip() if isinstance(image, str) and image.strip() else None
+
+
+_URL_SOURCE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def _registered_agent_entry(config: dict, agent: str) -> Optional[dict]:
+    """The last enabled ``agents[]`` entry of ``<fullsend_dir>/config.yaml``
+    whose ``name`` or source stem (``#`` fragment stripped) equals ``agent``,
+    case-insensitively — fullsend's ``findConfigAgentEntry`` lookup."""
+    entries = config.get("agents")
+    if not isinstance(entries, list):
+        return None
+    wanted = agent.casefold()
+    match = None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("enabled") is False:
+            continue
+        names = []
+        if isinstance(entry.get("name"), str):
+            names.append(entry["name"])
+        source = entry.get("source")
+        if isinstance(source, str) and source:
+            names.append(Path(source.split("#", 1)[0]).stem)
+        if any(n.casefold() == wanted for n in names):
+            match = entry
+    return match
+
+
+def _contained(root: Path, path: Path) -> Optional[Path]:
+    """``path`` resolved (symlinks followed), or ``None`` when it resolves
+    outside ``root`` or cannot be resolved (a looping or unreadable link)."""
+    resolved = _resolve_link(path)
+    resolved_root = _resolve_link(root)
+    if resolved is None or resolved_root is None:
+        return None
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return resolved
+
+
+def harness_file_image(fullsend_dir, agent: str) -> Optional[str]:
+    """``image:`` of the harness file fullsend would load for ``agent``.
+
+    A per-repo install registers the agent in ``<fullsend_dir>/config.yaml``
+    under ``agents[].source``, and fullsend resolves the harness as
+    ``<fullsend_dir>/<source>``. A matching entry decides the answer: a
+    relative ``source`` that stays inside ``fullsend_dir`` gives that file's
+    ``image:``; a URL source, an override-only entry (no ``source``) or an
+    unreadable file gives ``None``. Only when no entry matches is
+    ``<fullsend_dir>/harness/<agent>.yaml`` (``.yml`` when no ``.yaml`` exists)
+    tried. ``None`` when nothing yields an image."""
+    if not agent or not isinstance(agent, str) or Path(agent).name != agent:
+        return None
+    root = Path(fullsend_dir)
+    config_path = _contained(root, root / "config.yaml")
+    config = _read_yaml_mapping(config_path) if config_path else None
+    entry = _registered_agent_entry(config, agent) if config else None
+    if entry is not None:
+        source = entry.get("source")
+        if not isinstance(source, str):
+            return None
+        source = source.split("#", 1)[0].strip()
+        if not source or _URL_SOURCE_RE.match(source) or Path(source).is_absolute():
+            return None
+        path = _contained(root, root / source)
+        return _image_of(path) if path else None
+    for suffix in (".yaml", ".yml"):
+        candidate = root / "harness" / f"{agent}{suffix}"
+        if candidate.is_file():
+            path = _contained(root, candidate)
+            return _image_of(path) if path else None
+    return None
+
+
+def git_head(directory) -> Optional[str]:
+    """``git rev-parse HEAD`` of the checkout containing ``directory``, or
+    ``None`` when it is not inside one (or git is unavailable)."""
+    if not directory or not Path(directory).is_dir():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "HEAD"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=_PROBE_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    sha = (proc.stdout or "").strip()
+    return sha if proc.returncode == 0 and _GIT_SHA_RE.match(sha) else None

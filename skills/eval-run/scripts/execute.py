@@ -2142,7 +2142,9 @@ def _execute_per_case(args, config, runner, runner_cls,
         "agent": runner.name,
         "agent_version": getattr(runner, "version", ""),
         "execution_mode": config.execution.mode,
-        "eval_params": eval_params or {},
+        "eval_params": _with_runner_provenance(
+            eval_params, runner,
+            lambda: _case_console_logs(output_dir, case_results)),
         "per_case": case_results,
         "message_ids": sorted({i for r in case_results.values()
                                for i in (r.get("message_ids") or [])}),
@@ -2166,6 +2168,58 @@ def _execute_per_case(args, config, runner, runner_cls,
           f"{sum(1 for r in case_results.values() if r['exit_code'] != 0)} FAIL)")
 
     sys.exit(worst_exit)
+
+
+def _with_runner_provenance(eval_params, runner, console_texts):
+    """``eval_params`` plus the runner's run-level provenance, for runners that
+    record one (fullsend: versions, sandbox image, harness commit). Other
+    runners' params are returned unchanged, so those fields stay absent.
+    ``console_texts`` is a list or a callable returning one; a callable runs
+    inside the guard and only for runners that record provenance."""
+    params = dict(eval_params or {})
+    provenance = getattr(runner, "provenance", None)
+    if not callable(provenance):
+        return params
+    try:
+        texts = console_texts() if callable(console_texts) else console_texts
+        fields = provenance(texts)
+    except Exception as exc:  # provenance must never fail a run
+        print(f"WARNING: could not record {runner.name} provenance: {exc}",
+              file=sys.stderr)
+        return params
+    if isinstance(fields, dict):
+        params.update(fields)
+    return params
+
+
+def _read_console_log(path, max_chars):
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        with open(path, errors="replace") as fh:
+            return fh.read(max_chars)
+    except OSError:
+        return None
+
+
+def _case_console_logs(output_dir, case_results, max_chars=2_000_000):
+    """Each case's captured runner console output. A multi-step case keeps one
+    log per executed step (``steps/<step>/stderr.log``, in step order) because
+    the case-root ``stderr.log`` holds only the final step; other cases have
+    just the root log."""
+    texts = []
+    for case_id in sorted(case_results):
+        case_dir = output_dir / "cases" / case_id
+        steps = case_results[case_id].get("steps")
+        step_ids = list(steps) if isinstance(steps, dict) else []
+        paths = [case_dir / "steps" / sid / "stderr.log" for sid in step_ids
+                 if isinstance(sid, str) and Path(sid).name == sid]
+        found = [t for t in (_read_console_log(p, max_chars) for p in paths) if t]
+        if not found:
+            root = _read_console_log(case_dir / "stderr.log", max_chars)
+            found = [root] if root else []
+        texts.extend(found)
+    return texts
 
 
 def _copy_input_files_batch(workspace, output_dir):
@@ -2223,7 +2277,7 @@ def _save_result(result, args, output_dir, runner, model, eval_params=None):
         "agent": runner.name,
         "agent_version": getattr(runner, "version", ""),
         "execution_mode": "batch",
-        "eval_params": eval_params or {},
+        "eval_params": _with_runner_provenance(eval_params, runner, [result.stderr]),
         "message_ids": result.message_ids or [],
         "cost_source": result.cost_source,
         "error_class": result.error_class,
