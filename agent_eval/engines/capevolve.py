@@ -35,7 +35,7 @@ from pathlib import Path
 import yaml
 
 from agent_eval.config import EvalConfig, load_raw
-from agent_eval.optimize import artifact, export, intake
+from agent_eval.optimize import artifact, intake
 
 _SEARCH_KEYS = {
     "num_trials", "max_iterations", "stall", "max_usd", "max_metric_calls",
@@ -407,7 +407,7 @@ def _benchmark_facts(manifest: dict) -> str:
     )
 
 
-def _project_md(manifest: dict, resolved: dict, spec: dict, runs_dir: Path, substrate: dict) -> str:
+def _project_md(manifest: dict, resolved: dict, spec: dict, substrate: dict) -> str:
     credentials = intake.detected_credentials()
     overlay = resolved["overlay"]
     defaulted = resolved["defaulted"]
@@ -480,10 +480,13 @@ def _project_md(manifest: dict, resolved: dict, spec: dict, runs_dir: Path, subs
         "- Split: train/val/test — test is sealed, scored once at finalize.",
         "- Trajectories: `trajectories()` returns None (cap-evolve's per-rollout JSON, which "
         "embeds each transcript). The harness run records mix every split, so handing them to "
-        f"the optimizer would leak the sealed test set; they stay at `{runs_dir}/` for humans.",
+        "the optimizer would leak the sealed test set; they stay outside this project "
+        "directory, for humans only — do not read or list that directory from here.",
         "",
         "## Eval config",
-        f"- Base: `{manifest['base_eval_config']}` (not modified)",
+        "- Base: not modified. Its path is deliberately not printed here: it can hold judge "
+        "prompts/rubrics with gold answers or rationale, and this file lives inside the "
+        "directory the optimizer reads and edits every iteration.",
         (f"- Overlay: `{overlay}` (" + ("reused as-is" if resolved["reused_overlay"]
                                          else "generated: " + ", ".join(defaulted)) + ")")
         if overlay else "- Overlay: none (the eval config already declares optimize: and reward:)",
@@ -613,7 +616,7 @@ def prepare_project(
         "runner": runner,
         "env": harbor_env if runner == "harbor" else None,
         "image": image if runner == "harbor" else None,
-        "harness_python": sys.executable,
+        "harness_python": _venv_python(harness_root),
     }
     (adapters_dir / "substrate.json").write_text(
         json.dumps(substrate, indent=2) + "\n", encoding="utf-8",
@@ -669,7 +672,6 @@ def prepare_project(
     optimizer_dir = project_dir / "optimizer"
     optimizer_dir.mkdir(exist_ok=True)
     instructions_path = optimizer_dir / "INSTRUCTIONS.md"
-    runs_dir = export.runs_dir_for(candidate_manifest)
     instructions_path.write_text(
         _instructions(template_dir, _benchmark_facts(candidate_manifest)), encoding="utf-8",
     )
@@ -739,7 +741,7 @@ def prepare_project(
         yaml.safe_dump(spec, sort_keys=False), encoding="utf-8"
     )
     (project_dir / "PROJECT.md").write_text(
-        _project_md(candidate_manifest, resolved, spec, runs_dir, substrate), encoding="utf-8",
+        _project_md(candidate_manifest, resolved, spec, substrate), encoding="utf-8",
     )
     # Read by `cap-evolve run` into the run's spend ledger. Intake here is
     # mechanical — no LLM calls — so it costs nothing.
@@ -821,6 +823,22 @@ def _calibrate_cost_from_past_runs(config: EvalConfig, project_root: Path) -> fl
 
 # ── cap-evolve subprocess dispatch (check/estimate) ─────────────────────────
 
+def _venv_python(harness_root: Path) -> str:
+    """The interpreter that actually has cap-evolve-core on its sys.path.
+
+    ``sys.executable`` is wrong here: ``agent_eval._bootstrap`` activates the
+    venv by patching ``sys.path`` in THIS process (the common case — same
+    major.minor as the venv) and only re-execs (changing ``sys.executable``)
+    on an ABI mismatch. So after a normal `/eval-setup --optimize`, the
+    running interpreter can import cap_evolve while ``sys.executable`` still
+    names the system Python a *child* subprocess would get — which cannot.
+    Reuses ``_bootstrap``'s own venv-detection so the two never drift apart.
+    """
+    from agent_eval._bootstrap import _venv_python_and_site
+    venv_python, _ = _venv_python_and_site(str(harness_root))
+    return venv_python or sys.executable
+
+
 def _child_env(harness_root: Path, skills_dir: str | None = None) -> dict:
     env = dict(os.environ)
     old_path = env.get("PYTHONPATH", "")
@@ -836,7 +854,7 @@ def _child_env(harness_root: Path, skills_dir: str | None = None) -> dict:
 def _cap_evolve(args: list[str], *, cwd: Path, harness_root: Path, stream_stderr: bool = False,
                 skills_dir: str | None = None) -> dict:
     proc = subprocess.run(
-        [sys.executable, "-m", "cap_evolve.cli", *args],
+        [_venv_python(harness_root), "-m", "cap_evolve.cli", *args],
         cwd=cwd,
         env=_child_env(harness_root, skills_dir),
         stdout=subprocess.PIPE,
@@ -844,15 +862,22 @@ def _cap_evolve(args: list[str], *, cwd: Path, harness_root: Path, stream_stderr
         text=True,
     )
     # cap-evolve's stdout is a strict JSON contract; stderr is human chrome
-    # only and is never parsed for results.
+    # only and is never parsed for results — but it's the only place a crash
+    # (e.g. an import error) shows up, so every failure path below includes
+    # its tail rather than discarding it.
+    stderr_tail = (proc.stderr or "").strip()[-2000:] if not stream_stderr else ""
     if not proc.stdout.strip():
-        raise RuntimeError("cap-evolve returned empty stdout")
+        detail = f": {stderr_tail}" if stderr_tail else ""
+        raise RuntimeError(f"cap-evolve returned empty stdout{detail}")
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"cap-evolve stdout was not valid JSON: {exc}") from exc
+        detail = f" (stderr: {stderr_tail})" if stderr_tail else ""
+        raise RuntimeError(f"cap-evolve stdout was not valid JSON: {exc}{detail}") from exc
     if proc.returncode:
-        raise RuntimeError(json.dumps(payload, indent=2) if payload else "cap-evolve command failed")
+        message = json.dumps(payload, indent=2) if payload else "cap-evolve command failed"
+        detail = f"\nstderr: {stderr_tail}" if stderr_tail else ""
+        raise RuntimeError(f"{message}{detail}")
     return payload
 
 
@@ -960,7 +985,7 @@ def launch_detached(
     before = {p.name for p in runs_root.glob("run_*")}
 
     command = [
-        sys.executable, "-m", "cap_evolve.cli", "run",
+        _venv_python(harness_root), "-m", "cap_evolve.cli", "run",
         "--project", str(project_dir), "--spec", spec_path,
         "--max-usd", str(max_usd), "--max-iterations", str(max_iterations),
     ]
@@ -1001,10 +1026,34 @@ def launch_detached(
         "launched_at": time.time(),
         "max_usd": max_usd,
         "max_iterations": max_iterations,
-        "stop_hint": f"kill {proc.pid}",
+        # proc.pid is also the process group id (start_new_session=True
+        # above); plain `kill <pid>` would signal only the session leader and
+        # orphan any rollout/claude children still in that group.
+        "stop_hint": f"kill -- -{proc.pid}",
     }
     _write_campaign_manifest(project_dir, manifest)
     return manifest
+
+
+def stop_campaign(project_dir: Path) -> dict:
+    """Stop a launched campaign's whole process group, not just its leader.
+
+    ``launch_detached`` starts the campaign with ``start_new_session=True``,
+    so ``manifest["pid"]`` is also the process group id; signalling only that
+    pid (what the old ``stop_hint`` told users to do) leaves every rollout
+    and ``claude`` child orphaned and still spending.
+    """
+    manifest = read_campaign_manifest(project_dir)
+    if manifest is None:
+        return {"status": "not_launched"}
+    pid = manifest["pid"]
+    if not _is_alive(pid, manifest.get("create_time")):
+        return {"status": "already_stopped", "pid": pid}
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError) as exc:
+        return {"status": "could_not_stop", "pid": pid, "error": str(exc)}
+    return {"status": "stopped", "pid": pid}
 
 
 # ── Status ───────────────────────────────────────────────────────────────────
@@ -1231,8 +1280,16 @@ def apply_winner(*, project_root: Path, harness_manifest: dict, campaign_manifes
 
     # The campaign's own state lives in the benchmark checkout under
     # .capevolve/, which the benchmark need not gitignore: it is never part
-    # of "dirty", never committed, and never cleaned away on rollback.
-    dirty = _git(["status", "--porcelain", "--", ".", _CAPEVOLVE_EXCLUDE], cwd=project_root).stdout.strip()
+    # of "dirty", never committed, and never cleaned away on rollback. Every
+    # rollout the campaign runs also writes a harness run dir under
+    # AGENT_EVAL_RUNS_DIR (default eval/runs, optimize/export.py) — that's
+    # the campaign's own byproduct too, not real uncommitted work, so a
+    # benchmark that happens not to gitignore it must not have --apply
+    # refuse on that basis alone.
+    runs_dir_exclude = f":(exclude){os.environ.get('AGENT_EVAL_RUNS_DIR', 'eval/runs')}"
+    dirty = _git(
+        ["status", "--porcelain", "--", ".", _CAPEVOLVE_EXCLUDE, runs_dir_exclude], cwd=project_root,
+    ).stdout.strip()
     if dirty:
         raise RuntimeError("project working tree is not clean; commit or stash your changes before --apply")
     current_branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=project_root).stdout.strip()
@@ -1242,33 +1299,50 @@ def apply_winner(*, project_root: Path, harness_manifest: dict, campaign_manifes
         current_branch = _git(["rev-parse", "HEAD"], cwd=project_root).stdout.strip()
 
     branch = f"capevolve/{run_dir.name}"
-    _git(["checkout", "-b", branch], cwd=project_root)
+    try:
+        _git(["checkout", "-b", branch], cwd=project_root)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"could not create branch {branch!r}: {(exc.stderr or exc.stdout or '').strip()}"
+        ) from exc
     committed = False
     try:
-        changed = []
-        for src, dest, is_dir in targets:
-            if is_dir:
-                _replace_tracked_dir(src, dest, repo_root)
-            else:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dest)
-            changed.append(str(dest))
+        try:
+            changed = []
+            for src, dest, is_dir in targets:
+                if is_dir:
+                    _replace_tracked_dir(src, dest, repo_root)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
+                changed.append(str(dest))
 
-        _git(["add", "-A", "--", *changed], cwd=project_root)
-        message = (
-            f"cap-evolve: apply winning candidate {best_id}\n\n"
-            f"Run: {run_dir.name}\nTest delta: {final.get('test_delta')}\n"
-        )
-        _git(["commit", "-m", message], cwd=project_root)
-        committed = True
+            _git(["add", "-A", "--", *changed], cwd=project_root)
+            message = (
+                f"cap-evolve: apply winning candidate {best_id}\n\n"
+                f"Run: {run_dir.name}\nTest delta: {final.get('test_delta')}\n"
+            )
+            _git(["commit", "-m", message], cwd=project_root)
+            committed = True
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"git step failed while applying candidate {best_id}: "
+                f"{(exc.stderr or exc.stdout or '').strip()}"
+            ) from exc
     finally:
         if not committed:
             # Something failed mid-copy, before any commit landed on the new
             # branch. Wipe the partial copy so switching back leaves the
-            # user's original branch exactly as clean as --apply found it.
+            # user's original branch exactly as clean as --apply found it,
+            # and delete the branch itself — otherwise a retry of --apply
+            # for this same run_dir dies at `checkout -b` with "branch
+            # already exists", opaquely.
             _git(["reset", "--hard", "HEAD"], cwd=project_root)
             _git(["clean", "-fd", "--", ".", _CAPEVOLVE_EXCLUDE], cwd=project_root)
-        _git(["checkout", current_branch], cwd=project_root)
+            _git(["checkout", current_branch], cwd=project_root)
+            _git(["branch", "-D", branch], cwd=project_root)
+        else:
+            _git(["checkout", current_branch], cwd=project_root)
 
     # The optimistic-bias caveat needs real split sizes. cap-evolve freezes
     # the split to run_dir/splits.json (confirmed on-disk file, not a
@@ -1364,17 +1438,19 @@ def main(argv=None) -> int:
     parser.add_argument("--run", action="store_true",
                          help="explicit alias for launching (optional — bare --max-usd already launches)")
     parser.add_argument("--status", action="store_true", help="report progress of the launched campaign")
+    parser.add_argument("--stop", action="store_true",
+                         help="stop the launched campaign's whole process group (rollouts included)")
     parser.add_argument("--apply", action="store_true",
                          help="apply a finished campaign's winning candidate onto a new git branch")
     parser.add_argument("--setup", action="store_true",
                         help="verify cap-evolve-core and fetch its pinned skills tree (run by /eval-setup --optimize)")
     args = parser.parse_args(argv)
 
-    explicit = sum([args.dry_run, args.status, args.apply, args.setup])
+    explicit = sum([args.dry_run, args.status, args.stop, args.apply, args.setup])
     if explicit > 1:
-        parser.error("choose exactly one of --dry-run, --status, --apply, or --setup")
+        parser.error("choose exactly one of --dry-run, --status, --stop, --apply, or --setup")
     if explicit == 1 and args.run:
-        parser.error("--run cannot be combined with --dry-run/--status/--apply/--setup")
+        parser.error("--run cannot be combined with --dry-run/--status/--stop/--apply/--setup")
     if args.setup:
         try:
             require_cap_evolve()
@@ -1389,16 +1465,23 @@ def main(argv=None) -> int:
         mode = "dry_run"
     elif args.status:
         mode = "status"
+    elif args.stop:
+        mode = "stop"
     elif args.apply:
         mode = "apply"
     elif args.run or args.max_usd is not None:
         mode = "launch"
     else:
-        parser.error("choose --dry-run, --status, --apply, or provide --max-usd to launch")
+        parser.error("choose --dry-run, --status, --stop, --apply, or provide --max-usd to launch")
 
-    if mode in ("status", "apply"):
+    if mode in ("status", "stop", "apply"):
         try:
-            result = _cmd_status() if mode == "status" else _cmd_apply()
+            if mode == "status":
+                result = _cmd_status()
+            elif mode == "stop":
+                result = stop_campaign(_project_dir())
+            else:
+                result = _cmd_apply()
             print(json.dumps(result, indent=2, default=str))
             return 0
         except Exception as exc:
