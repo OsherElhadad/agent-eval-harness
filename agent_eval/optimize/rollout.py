@@ -55,13 +55,28 @@ def _run_script(
     allow_nonzero: bool = False,
 ) -> subprocess.CompletedProcess:
     cmd = [sys.executable, str(_script(manifest, name)), *map(str, args)]
-    proc = subprocess.run(
-        cmd,
-        cwd=manifest["project_root"],
-        env=_child_env(),
-        capture_output=True,
-        text=True,
-    )
+    # The Harbor substrate passes --agent-timeout from this same manifest
+    # field (:442); the local substrate has no equivalent cap of its own, so
+    # a hung step here (network stall, a runaway agent loop) blocks the
+    # whole campaign forever — max_usd never gets a chance to trigger
+    # because nothing returns. Each of the 5 steps gets its own budget
+    # rather than one shared across workspace/execute/collect/score/report.
+    timeout_s = (manifest.get("agent_timeout_s") or 1800) + 300
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=manifest["project_root"],
+            env=_child_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        detail = (exc.stderr or exc.stdout or b"")
+        detail = detail.decode("utf-8", "replace") if isinstance(detail, bytes) else (detail or "")
+        raise RuntimeError(
+            f"{name} timed out after {timeout_s}s: {detail.strip()[-5000:]}"
+        ) from exc
     if proc.returncode and not allow_nonzero:
         detail = (proc.stderr or proc.stdout or "").strip()[-5000:]
         raise RuntimeError(f"{name} failed ({proc.returncode}): {detail}")
