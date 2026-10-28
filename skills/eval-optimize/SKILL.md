@@ -1,6 +1,6 @@
 ---
 name: eval-optimize
-description: Automated skill improvement loop. Runs eval, identifies judge failures, reads traces and rationale, edits the SKILL.md to fix issues, re-runs to verify, and checks for regressions. Use when the user wants to automatically improve a skill based on eval results, fix failing judges, make the skill better, auto-fix quality issues, improve scores, or iterate until all judges pass. Triggers on "optimize the skill", "make it pass", "auto-fix", "improve the scores", "why is it failing". Works best after /eval-run has produced results to learn from.
+description: Automated skill improvement. Default: an interactive loop that runs eval, identifies judge failures, reads traces and rationale, edits the SKILL.md, re-runs, and checks for regressions. Pass --engine capevolve for statistically validated optimization instead (train/val/test splits, a significance gate, sealed test). Use when the user wants to improve a skill based on eval results, fix failing judges, improve scores, or iterate until judges pass. Triggers on "optimize the skill", "make it pass", "auto-fix", "cap-evolve". Works best after /eval-run has produced results.
 user-invocable: true
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent, Skill, AskUserQuestion
 ---
@@ -15,12 +15,18 @@ The key difference from `/eval-review`: you act autonomously. You read judge rat
 
 **`--engine capevolve` dispatch.** If `--engine capevolve` is among the
 arguments, this is the automated, statistically-gated cap-evolve path, not
-the interactive loop below — skip every other step in this file. Parse only
-`--config`, `--max-usd`, `--max-iterations`, `--num-trials`, `--dry-run`,
-`--pilot-case-ids`, `--runner-budget-usd`, `--runner`, `--env`, `--image`, `--reintake`,
-`--optimizer`, `--optimizer-model`, `--skills-dir`, `--status`, and `--apply`
-from the arguments (ignore `--model`/`--run-id`/`--target-judge`, which don't
-apply here). Note the current scope limits (local or Harbor
+the interactive loop below — skip every other step in this file. Unlike that
+loop, it splits cases into train/val/test, accepts a candidate only on a
+significance gate over val (a small change comes back "indecisive", never
+banked as progress), and scores test exactly once. Prefer it over the
+default loop below whenever that stronger guarantee is worth the setup.
+
+Parse only `--config`, `--max-usd`, `--max-iterations`, `--num-trials`,
+`--dry-run`, `--pilot-case-ids`, `--runner-budget-usd`, `--runner`, `--env`,
+`--image`, `--reintake`, `--optimizer`, `--optimizer-model`, `--skills-dir`,
+`--seed`, `--split-ratios`, `--run`, `--setup`, `--status`, `--stop`, and
+`--apply` from the arguments (ignore `--model`/`--run-id`/`--target-judge`,
+which don't apply here). Note the current scope limits (local or Harbor
 substrate; EvalHub is refused). Do not proceed to Step 1 below for a
 `--engine capevolve` invocation. The underlying command for every mode is
 `python3 ${CLAUDE_SKILL_DIR}/scripts/capevolve.py <flags>`, run from the
@@ -57,16 +63,18 @@ the `git checkout` that fixes it.
   "indecisive" rather than "accept" at small val sizes, and the cost estimate
   as a **range**, blended with `observed_cost_per_rollout` when the response
   includes one (calibrated from this eval's own past runs).
-- **Launch** (no `--dry-run`/`--status`/`--apply`, `--max-usd` given): before
-  running the command, confirm the spend with the user via `AskUserQuestion`
-  — state the budget, the iteration/trial counts, and the cost estimate from
-  the prior `--dry-run` if you have it in context. Only run the launch command
-  after they confirm. It launches the campaign **detached** and returns
-  immediately — it does not block waiting for the result. Tell the user that,
-  give them the printed `run_dir`/`pid`/`log_file`, and how to stop it
-  (the response's `stop_hint`, e.g. `kill <pid>`). Point them at `--status`
-  (from any later session — it needs no `--config`, since the campaign runs
-  detached from this one) to check progress and `--apply` once it finishes.
+- **Launch** (no `--dry-run`/`--status`/`--stop`/`--apply`, `--max-usd`
+  given): confirm the spend with the user via `AskUserQuestion` first —
+  budget, iteration/trial counts, the prior `--dry-run` cost estimate if you
+  have one. It launches detached and returns immediately. Give the user the
+  printed `run_dir`/`pid`/`log_file`; use `--stop` to end it (signals the
+  whole process group — never tell the user to `kill <pid>` themselves,
+  that leaves rollouts running and spending), and
+  `cap-evolve dashboard --base <benchmark>/.capevolve` to watch it live
+  (needs the dashboard backend installed — see the cap-evolve guide). Point
+  them at `--status`/`--apply` once it finishes.
+- **`--stop`**: run it, then report its `status` plainly (stopped / already
+  stopped / could not be stopped).
 - **`--status`**: run it, then interpret the result in prose rather than
   printing raw JSON: report `status` plainly (not launched / running /
   finished / stopped — if stopped, say to check `log_file`). If `warnings`
@@ -91,6 +99,7 @@ the `git checkout` that fixes it.
 
 | Argument | Required | Default | Description |
 |----------|----------|---------|-------------|
+| `--engine <capevolve>` | no | the interactive loop below | Pass `--engine capevolve` for statistically validated optimization instead (see Step 0) |
 | `--config <path>` | no | auto-discover | Path to eval config |
 | `--model <model>` | no | `models.skill` from eval.yaml | Model to use for eval runs (overrides config default) |
 | `--max-iterations <N>` | no | 3 | Stop after N improvement cycles |
