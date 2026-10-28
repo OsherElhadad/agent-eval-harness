@@ -4987,9 +4987,8 @@ def compare_runs(run_a_dir, run_b_dir, config, case_ids,
         "wins_a": wins_a, "wins_b": wins_b,
         "ties": ties, "errors": errors,
         # Of those errors, the ones where no comparison was possible because
-        # a side's evidence could not be read. Reported rather than gated:
-        # `min_win_rate` reads a `win_rate` nothing in the harness writes
-        # yet, so there is no live gate to hang this on (see #281).
+        # a side's evidence could not be read. Kept out of the win rate;
+        # `detect_regressions` gates it separately when `min_win_rate` is set.
         "incomplete_cases": sum(1 for r in results if r.evidence_lost),
         "per_case": [{"case_id": r.case_id, "winner": r.winner, "error": r.error,
                       "reasoning": r.reasoning}
@@ -5440,10 +5439,115 @@ def _unavailable_reason(current, metric, kind):
             f"or not {kind}")
 
 
-def detect_regressions(current_results, thresholds, baseline_results=None):
+# Default for `detect_regressions(pairwise=...)`: the caller has no pairwise
+# comparison to offer — `score.py judges` runs before `score.py pairwise`, and
+# Harbor/EvalHub never run one — so `min_win_rate` is left to `score.py
+# regression`. Distinct from `None`, which means "this run recorded none".
+PAIRWISE_NOT_EVALUATED = object()
+
+
+def pairwise_win_rate(pairwise):
+    """The candidate's win rate from a run's `summary["pairwise"]` section.
+
+    `cmd_pairwise` compares the run under test as A against the baseline as B,
+    so a win is `wins_a`. Ties count against the candidate (it has to beat the
+    baseline, not match it); errored comparisons carry no verdict and leave the
+    denominator. A tie is also what `PairwiseResult.winner` returns for any
+    inconsistent verdict pair, position bias included, so judge instability is
+    charged against the candidate. Returns `(win_rate, reason)` — `win_rate` is None, with the
+    reason, when no comparison produced a verdict.
+    """
+    if not isinstance(pairwise, dict):
+        return None, ("win_rate unavailable — no pairwise comparison recorded "
+                      "(run `score.py pairwise --baseline <id>`)")
+    wins_a = pairwise.get("wins_a") or 0
+    decided = wins_a + (pairwise.get("wins_b") or 0) + (pairwise.get("ties") or 0)
+    if not decided:
+        errors = pairwise.get("errors") or 0
+        return None, (f"win_rate unavailable — every pairwise comparison "
+                      f"errored ({errors} case{'s' if errors != 1 else ''})"
+                      if errors else
+                      "win_rate unavailable — no pairwise comparisons recorded")
+    return wins_a / decided, ""
+
+
+def _pairwise_regressions(judge_name, threshold, pairwise,
+                          incomplete_flagged=False):
+    """Threshold breaches for the pairwise judge, read from the run's
+    `pairwise` section: `min_win_rate` and `max_error_rate`.
+
+    The judge never has a `judges` aggregate, so these are its only gates.
+    `max_error_rate` is `errors / cases_compared` — the share of comparisons
+    that produced no verdict, the scoring path's `errored / (errored + scored)`.
+
+    `min_win_rate` mirrors the score-threshold gate: a comparison that could not read a side's
+    evidence is an error and leaves the win-rate denominator, so the win rate
+    over the survivors would pass. `incomplete_cases` is therefore reported as
+    the same `incomplete_staging` regression, separately from the win rate.
+    `incomplete_flagged` is set when the caller already emitted it for this
+    judge."""
+    regressions = []
+    section = pairwise if isinstance(pairwise, dict) else {}
+    compared = section.get("cases_compared") or 0
+    if "max_error_rate" in threshold:
+        errors = section.get("errors") or 0
+        bound = f"<= {threshold['max_error_rate']}"
+        if not compared:
+            # 0 of 0 is an unmeasured error rate, not a 0% one — the same
+            # input `min_win_rate` reports as unavailable. A missing, empty or
+            # non-dict section all land here: none of them recorded a comparison.
+            regressions.append(Regression(
+                judge_name, "error_rate", bound, "n/a",
+                "error_rate unavailable — no pairwise comparison recorded "
+                "(run `score.py pairwise --baseline <id>`)"))
+        else:
+            rate = errors / compared
+            if rate > threshold["max_error_rate"]:
+                regressions.append(Regression(
+                    judge_name, "error_rate", bound,
+                    f"{rate:.3f}", f"{errors} of {compared} cases errored"))
+    if "min_win_rate" not in threshold:
+        return regressions
+    incomplete = section.get("incomplete_cases") or 0
+    if incomplete and not incomplete_flagged:
+        regressions.append(Regression(
+            judge_name, "incomplete_staging", "== 0", str(incomplete),
+            f"{incomplete} of {max(compared, incomplete)} pairwise "
+            "comparisons could not read a side's evidence; a win rate over "
+            "the remaining cases is not a measurement of the agent"))
+    win_rate, reason = pairwise_win_rate(pairwise)
+    bound = f">= {threshold['min_win_rate']}"
+    if win_rate is None:
+        regressions.append(Regression(judge_name, "win_rate", bound, "n/a", reason))
+    elif win_rate < threshold["min_win_rate"]:
+        regressions.append(Regression(judge_name, "win_rate", bound,
+                                      f"{win_rate:.3f}"))
+    return regressions
+
+
+def detect_regressions(current_results, thresholds, baseline_results=None,
+                       pairwise=PAIRWISE_NOT_EVALUATED):
+    """Threshold breaches for one run.
+
+    `pairwise` is the run's `summary["pairwise"]` section (None when it has
+    none) — the source of `win_rate`, which `min_win_rate` gates. Leave it at
+    the default only where no comparison can have run yet; `min_win_rate` is
+    then not checked.
+    """
+    check_win_rate = pairwise is not PAIRWISE_NOT_EVALUATED
     regressions = []
     for judge_name, threshold in thresholds.items():
         current = current_results.get(judge_name)
+        # The pairwise judge never has a `judges` aggregate — its result is the
+        # run's `pairwise` section — so all of its gates are checked here,
+        # before the aggregate checks below that it does not take part in.
+        pairwise_owns = check_win_rate and judge_name == "pairwise"
+        if pairwise_owns:
+            regressions.extend(_pairwise_regressions(
+                judge_name, threshold, pairwise,
+                # An aggregate (if one is ever present) reports its own
+                # incomplete count below; report it once.
+                incomplete_flagged=bool((current or {}).get("incomplete_cases"))))
         if current is None:
             continue
         incomplete = current.get("incomplete_cases") or 0
@@ -5469,7 +5573,7 @@ def detect_regressions(current_results, thresholds, baseline_results=None):
         # say how much of the dataset actually has to be scored. Off unless
         # declared, because one flaky judge run should not fail a suite by
         # default.
-        if "max_error_rate" in threshold:
+        if "max_error_rate" in threshold and not pairwise_owns:
             errored = current.get("errored_cases") or 0
             scored = current.get("scored_cases")
             if scored is None:            # pre-1.38 summary.yaml
@@ -5521,16 +5625,13 @@ def detect_regressions(current_results, thresholds, baseline_results=None):
             elif mean < threshold["min_mean"]:
                 regressions.append(Regression(judge_name, "mean",
                                               f">= {threshold['min_mean']}", str(mean)))
-        if "min_win_rate" in threshold:
-            win_rate = current.get("win_rate")
-            if win_rate is None:
-                regressions.append(Regression(
-                    judge_name, "win_rate", f">= {threshold['min_win_rate']}",
-                    "n/a", "win_rate unavailable — not a pairwise judge or no "
-                    "comparisons recorded"))
-            elif win_rate < threshold["min_win_rate"]:
-                regressions.append(Regression(judge_name, "win_rate",
-                                              f">= {threshold['min_win_rate']}", str(win_rate)))
+        if "min_win_rate" in threshold and judge_name != "pairwise":
+            # The run-wide pairwise comparison is the pairwise judge's
+            # result only; on any other judge `min_win_rate` is a wrong-type
+            # threshold and must fail loudly, not borrow that verdict.
+            regressions.append(Regression(
+                judge_name, "win_rate", f">= {threshold['min_win_rate']}",
+                "n/a", "win_rate unavailable — not a pairwise judge"))
         if baseline_results:
             if baseline and current:
                 for key in ("mean", "pass_rate"):
@@ -5750,6 +5851,11 @@ def cmd_judges(args):
                       f"{r.baseline_value} -> {r.current_value}")
         else:
             print("\n  REGRESSIONS: 0")
+        # The comparison `min_win_rate` gates runs after this step.
+        if any(isinstance(t, dict) and "min_win_rate" in t
+               for t in config.thresholds.values()):
+            print("  (min_win_rate not checked here — run `score.py pairwise` "
+                  "then `score.py regression`)")
 
     if has_regressions:
         sys.exit(1)
@@ -5852,7 +5958,8 @@ def cmd_regression(args):
             with open(baseline_path) as f:
                 baseline_agg = (yaml.safe_load(f) or {}).get("judges", {})
 
-    regressions = detect_regressions(current_agg, config.thresholds, baseline_agg)
+    regressions = detect_regressions(current_agg, config.thresholds, baseline_agg,
+                                     pairwise=summary.get("pairwise"))
     if regressions:
         print(f"REGRESSIONS: {len(regressions)} detected")
         for r in regressions:
