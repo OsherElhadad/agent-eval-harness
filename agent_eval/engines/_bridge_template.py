@@ -115,11 +115,24 @@ class Bridge(CapabilityAdapter):
             "--candidate-dir", str(candidate_dir),
             "--seed", str(seed),
         ]
-        proc = subprocess.run(command, cwd=self.project_root, env=env, capture_output=True, text=True)
+        # Outer bound on the whole rollout (workspace/execute/collect/score/
+        # report, or Harbor generation+execution): without it a hang in any
+        # step blocks the campaign forever, since max_usd never gets the
+        # chance to trigger if this call never returns.
+        timeout_s = (self.manifest.get("agent_timeout_s") or 1800) + 600
+        try:
+            proc = subprocess.run(
+                command, cwd=self.project_root, env=env, capture_output=True, text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            detail = exc.stderr or exc.stdout or b""
+            detail = detail.decode("utf-8", "replace") if isinstance(detail, bytes) else (detail or "")
+            raise RuntimeError(f"harness rollout timed out after {timeout_s}s: {detail.strip()[-2000:]}") from exc
         # The rollout's stdout is a strict JSON contract. Stderr is diagnostic
         # text only and is never parsed for results.
         if not proc.stdout.strip():
-            raise RuntimeError("harness rollout returned empty stdout")
+            raise RuntimeError(f"harness rollout returned empty stdout: {(proc.stderr or '').strip()[-2000:]}")
         try:
             payload = json.loads(proc.stdout)
         except json.JSONDecodeError as exc:
@@ -146,9 +159,13 @@ class Bridge(CapabilityAdapter):
         except Exception as exc:
             # cap-evolve interprets Rollout.error as missing data/noise. Raising
             # here would abort serial evaluations instead of applying on_error.
+            # _invoke_rollout already puts the real cause (the rollout's own
+            # error field, or its stderr) into str(exc) — keep it, truncated,
+            # instead of discarding it down to just the exception's type name.
+            detail = str(exc).strip()[-2000:]
             return Rollout(
                 task_id=task.id,
-                error=f"harness rollout failed ({type(exc).__name__}); measurement unavailable",
+                error=f"harness rollout failed ({type(exc).__name__}): {detail}; measurement unavailable",
             )
 
     def score(self, task, rollout):

@@ -281,10 +281,11 @@ def _execute_local(manifest: dict, task_id: str, candidate_dir: Path, run_id: st
     if manifest.get("plugin_dir"):
         # The candidate lives in a runner plugin: run against a private copy.
         private = workspace.with_name(f"{run_id}.plugin")
-        private.mkdir(parents=True)
-        _private_plugin(manifest, candidate_dir, private / "plugin")
-        config_path = str(_rollout_config(manifest, private, private / "plugin"))
     try:
+        if private is not None:
+            private.mkdir(parents=True)
+            _private_plugin(manifest, candidate_dir, private / "plugin")
+            config_path = str(_rollout_config(manifest, private, private / "plugin"))
         _execute_local_steps(manifest, task_id, candidate_dir, run_id, run_dir, workspace, config_path,
                              stage_in_workspace=private is None)
     finally:
@@ -389,13 +390,27 @@ def _execute_local_steps(
 # ── Harbor substrate ─────────────────────────────────────────────────────────
 
 def _run_harness(manifest: dict, cmd: list, *, allow_nonzero: bool = False) -> subprocess.CompletedProcess:
-    proc = subprocess.run(
-        [sys.executable, *map(str, cmd)],
-        cwd=manifest["project_root"],
-        env=_child_env(),
-        capture_output=True,
-        text=True,
-    )
+    # Unlike the local substrate's _run_script, this had no cap at all: a
+    # hang in Harbor task generation, container setup, or execution blocked
+    # the campaign forever, since max_usd never gets the chance to trigger
+    # if this call never returns. Give generation+container startup margin
+    # on top of the per-agent timeout already passed to harbor.py (:442).
+    timeout_s = (manifest.get("agent_timeout_s") or 1800) + 900
+    try:
+        proc = subprocess.run(
+            [sys.executable, *map(str, cmd)],
+            cwd=manifest["project_root"],
+            env=_child_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        detail = exc.stderr or exc.stdout or b""
+        detail = detail.decode("utf-8", "replace") if isinstance(detail, bytes) else (detail or "")
+        raise RuntimeError(
+            f"{cmd[0]} {cmd[1] if len(cmd) > 1 else ''} timed out after {timeout_s}s: {detail.strip()[-5000:]}"
+        ) from exc
     if proc.returncode and not allow_nonzero:
         detail = (proc.stderr or proc.stdout or "").strip()[-5000:]
         raise RuntimeError(f"{cmd[0]} {cmd[1] if len(cmd) > 1 else ''} failed ({proc.returncode}): {detail}")
