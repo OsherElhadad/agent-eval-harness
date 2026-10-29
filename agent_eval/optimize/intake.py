@@ -230,7 +230,9 @@ def _top_level_name(path: Path, project_root: Path) -> str | None:
     return rel.parts[0] if rel.parts else None
 
 
-def runtime_resources(project_root: Path, config: EvalConfig, components: list[dict]) -> list[str]:
+def runtime_resources(
+    project_root: Path, config: EvalConfig, components: list[dict],
+) -> tuple[list[str], list[str]]:
     """Project paths a rollout must copy into its workspace.
 
     The harness's default project links, plus every top-level project
@@ -265,7 +267,8 @@ def runtime_resources(project_root: Path, config: EvalConfig, components: list[d
     # would get it in a normal run but silently miss it from every
     # optimization rollout — no error, just a possibly-wrong result against
     # an incomplete workspace.
-    default_resources = (*DEFAULT_RUNTIME_RESOURCES, *(getattr(config.execution, "symlinks", None) or []))
+    configured_symlinks = list(getattr(config.execution, "symlinks", None) or [])
+    default_resources = (*DEFAULT_RUNTIME_RESOURCES, *configured_symlinks)
     entries = {
         p.name: p for p in sorted(root.iterdir())
         if p.name not in excluded and p.name in default_resources
@@ -274,6 +277,15 @@ def runtime_resources(project_root: Path, config: EvalConfig, components: list[d
     }
 
     included = [name for name in default_resources if name in entries]
+    # Unlike a default entry (silently skipped if the project doesn't have
+    # it, matching workspace.py's own behavior), a configured symlink
+    # missing here is a configuration mistake that would otherwise hide
+    # silently — once per name, not once per rollout.
+    warnings = [
+        f"execution.symlinks entry {name!r} not found (or excluded as measurement "
+        "material) under the project root; every optimization rollout will miss it"
+        for name in configured_symlinks if name not in included
+    ]
     sources = [Path(c["source"]) for c in components]
     settings = root / ".claude" / "settings.json"
     if settings.is_file():
@@ -292,7 +304,7 @@ def runtime_resources(project_root: Path, config: EvalConfig, components: list[d
             if re.search(rf"(?:[\"']|\.\./){re.escape(name)}(?=[/\"'])", text):
                 included.append(name)
                 sources.append(path)
-    return included
+    return included, warnings
 
 
 # ── Overlay + full intake ────────────────────────────────────────────────────

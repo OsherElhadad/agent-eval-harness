@@ -39,6 +39,13 @@ def read_usage(run_dir: Path, summary: dict) -> tuple[float, int, str]:
     usage = run_result.get("token_usage") or {}
     tokens = sum(int(value) for value in usage.values() if _is_number(value))
     judge_usage = summary.get("judge_usage") or {}
+    # judge_usage carries its own token fields (prompt/completion/reasoning) —
+    # score.py's aggregate_judge_usage() docstring — separate from run_result's
+    # token_usage, so the exported total silently dropped them otherwise.
+    tokens += sum(
+        int(judge_usage[key]) for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens")
+        if _is_number(judge_usage.get(key))
+    )
     judge_cost = judge_usage.get("judge_cost_usd")
     has_runner_cost = _is_number(cost)
     has_judge_cost = _is_number(judge_cost)
