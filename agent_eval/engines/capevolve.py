@@ -20,6 +20,7 @@ import agent_eval._bootstrap  # noqa: F401 — auto-activate venv before PyYAML/
 import argparse
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -532,14 +533,20 @@ def prepare_project(
     recording ``BLOCKED:`` lines in ``PROJECT.md`` — when a NEEDED input cannot
     be resolved from the benchmark.
     """
-    if max_usd <= 0:
-        raise ValueError("--max-usd must be positive; cap-evolve uses 0 for unlimited spend")
+    # math.isfinite() first: relational comparisons alone accept CLI floats
+    # argparse's type=float will happily parse ("nan" compares false against
+    # everything, so `<= 0` never rejects it; "inf" passes `> 0` as if it
+    # were a normal positive budget) — either would otherwise reach the
+    # generated spec and the launch command uncaught.
+    if not math.isfinite(max_usd) or max_usd <= 0:
+        raise ValueError("--max-usd must be a finite positive number; cap-evolve uses 0 for unlimited spend")
     if max_iterations < 1 or num_trials < 1:
         raise ValueError("--max-iterations and --num-trials must be positive")
-    if len(split_ratios) != 3 or any(r <= 0 for r in split_ratios) or abs(sum(split_ratios) - 1) > 1e-6:
-        raise ValueError("--split-ratios must be three positive values summing to 1")
-    if runner_budget_usd is not None and runner_budget_usd <= 0:
-        raise ValueError("--runner-budget-usd must be positive")
+    if (len(split_ratios) != 3 or any(not math.isfinite(r) or r <= 0 for r in split_ratios)
+            or abs(sum(split_ratios) - 1) > 1e-6):
+        raise ValueError("--split-ratios must be three finite positive values summing to 1")
+    if runner_budget_usd is not None and (not math.isfinite(runner_budget_usd) or runner_budget_usd <= 0):
+        raise ValueError("--runner-budget-usd must be a finite positive number")
     if pilot_case_ids and len(pilot_case_ids) != 3:
         raise ValueError("a pilot run uses exactly three cases (train, val, test)")
     if runner in _UNSUPPORTED_SUBSTRATES:
@@ -621,6 +628,7 @@ def prepare_project(
     (adapters_dir / "substrate.json").write_text(
         json.dumps(substrate, indent=2) + "\n", encoding="utf-8",
     )
+    runtime_resources, runtime_resource_warnings = intake.runtime_resources(project_root, config, components)
     # adapters/candidate.json — the task/candidate manifest the bridge and the
     # rollout subprocess both read.
     candidate_manifest = {
@@ -643,7 +651,7 @@ def prepare_project(
             {"dest": item["dest"], "source": item["source"], "is_dir": item["is_dir"]}
             for item in components
         ],
-        "runtime_resources": intake.runtime_resources(project_root, config, components),
+        "runtime_resources": runtime_resources,
         # Where the candidate is live at run time: the project's .claude/skills
         # (staged into the rollout workspace) or a runner plugin's skill root
         # (a private copy of the plugin per rollout).
@@ -771,7 +779,7 @@ def prepare_project(
         # overlay's optimize.candidate list is how a user narrows the scope.
         "candidate_sources": [os.path.relpath(item["source"], project_root) for item in components],
         "models": models,
-        "warnings": model_warnings,
+        "warnings": model_warnings + runtime_resource_warnings,
         "runtime_resources": candidate_manifest["runtime_resources"],
         "cap_evolve_templates": str(template_dir) if template_dir else None,
         "splits": {
@@ -1042,16 +1050,25 @@ def stop_campaign(project_dir: Path) -> dict:
     so ``manifest["pid"]`` is also the process group id; signalling only that
     pid (what the old ``stop_hint`` told users to do) leaves every rollout
     and ``claude`` child orphaned and still spending.
+
+    Checking only the leader's liveness before deciding "already stopped"
+    is wrong: the leader can exit while a rollout or ``claude`` child is
+    still running in the group, and that case is exactly what ``--stop``
+    exists for. A process group id stays valid as long as any process is
+    still a member of it (POSIX never reuses a pgid with live members), so
+    attempting the kill directly — rather than pre-checking the leader — is
+    both simpler and correct: ``ProcessLookupError`` from ``killpg`` itself
+    means no process is left in that group.
     """
     manifest = read_campaign_manifest(project_dir)
     if manifest is None:
         return {"status": "not_launched"}
     pid = manifest["pid"]
-    if not _is_alive(pid, manifest.get("create_time")):
-        return {"status": "already_stopped", "pid": pid}
     try:
         os.killpg(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError) as exc:
+    except ProcessLookupError:
+        return {"status": "already_stopped", "pid": pid}
+    except PermissionError as exc:
         return {"status": "could_not_stop", "pid": pid, "error": str(exc)}
     return {"status": "stopped", "pid": pid}
 
@@ -1285,11 +1302,19 @@ def apply_winner(*, project_root: Path, harness_manifest: dict, campaign_manifes
     # AGENT_EVAL_RUNS_DIR (default eval/runs, optimize/export.py) — that's
     # the campaign's own byproduct too, not real uncommitted work, so a
     # benchmark that happens not to gitignore it must not have --apply
-    # refuse on that basis alone.
-    runs_dir_exclude = f":(exclude){os.environ.get('AGENT_EVAL_RUNS_DIR', 'eval/runs')}"
-    dirty = _git(
-        ["status", "--porcelain", "--", ".", _CAPEVOLVE_EXCLUDE, runs_dir_exclude], cwd=project_root,
-    ).stdout.strip()
+    # refuse on that basis alone. Only add the exclude when that dir
+    # resolves inside the repo — like export.runs_dir_for, an unset/relative
+    # AGENT_EVAL_RUNS_DIR is relative to project_root, but a user can also
+    # point it absolute and outside the repo entirely, and git's own
+    # `:(exclude)` pathspec hard-errors on a path outside the worktree.
+    pathspecs = [".", _CAPEVOLVE_EXCLUDE]
+    runs_dir = Path(os.environ.get("AGENT_EVAL_RUNS_DIR", "eval/runs"))
+    if not runs_dir.is_absolute():
+        runs_dir = project_root / runs_dir
+    runs_dir = runs_dir.resolve()
+    if runs_dir.is_relative_to(repo_root):
+        pathspecs.append(f":(exclude){runs_dir.relative_to(project_root.resolve())}")
+    dirty = _git(["status", "--porcelain", "--", *pathspecs], cwd=project_root).stdout.strip()
     if dirty:
         raise RuntimeError("project working tree is not clean; commit or stash your changes before --apply")
     current_branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=project_root).stdout.strip()
@@ -1305,44 +1330,55 @@ def apply_winner(*, project_root: Path, harness_manifest: dict, campaign_manifes
         raise RuntimeError(
             f"could not create branch {branch!r}: {(exc.stderr or exc.stdout or '').strip()}"
         ) from exc
-    committed = False
     try:
-        try:
-            changed = []
-            for src, dest, is_dir in targets:
-                if is_dir:
-                    _replace_tracked_dir(src, dest, repo_root)
-                else:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dest)
-                changed.append(str(dest))
+        changed = []
+        for src, dest, is_dir in targets:
+            if is_dir:
+                _replace_tracked_dir(src, dest, repo_root)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+            changed.append(str(dest))
 
-            _git(["add", "-A", "--", *changed], cwd=project_root)
-            message = (
-                f"cap-evolve: apply winning candidate {best_id}\n\n"
-                f"Run: {run_dir.name}\nTest delta: {final.get('test_delta')}\n"
-            )
-            _git(["commit", "-m", message], cwd=project_root)
-            committed = True
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"git step failed while applying candidate {best_id}: "
-                f"{(exc.stderr or exc.stdout or '').strip()}"
-            ) from exc
-    finally:
-        if not committed:
-            # Something failed mid-copy, before any commit landed on the new
-            # branch. Wipe the partial copy so switching back leaves the
-            # user's original branch exactly as clean as --apply found it,
-            # and delete the branch itself — otherwise a retry of --apply
-            # for this same run_dir dies at `checkout -b` with "branch
-            # already exists", opaquely.
+        _git(["add", "-A", "--", *changed], cwd=project_root)
+        message = (
+            f"cap-evolve: apply winning candidate {best_id}\n\n"
+            f"Run: {run_dir.name}\nTest delta: {final.get('test_delta')}\n"
+        )
+        _git(["commit", "-m", message], cwd=project_root)
+    except Exception as exc:
+        # Something failed before a commit landed on the new branch. Wipe
+        # the partial copy so switching back leaves the user's original
+        # branch exactly as clean as --apply found it, and delete the
+        # branch itself — otherwise a retry of --apply for this same
+        # run_dir dies at `checkout -b` with "branch already exists",
+        # opaquely. `clean -fd` must exclude the same runs dir the
+        # dirty-check does: it's untracked by design (not part of what
+        # --apply wrote), and can hold nested opt-* or pre-existing
+        # /eval-run records that predate this campaign.
+        apply_error = (
+            RuntimeError(f"git step failed while applying candidate {best_id}: "
+                        f"{(exc.stderr or exc.stdout or '').strip()}")
+            if isinstance(exc, subprocess.CalledProcessError) else exc
+        )
+        try:
             _git(["reset", "--hard", "HEAD"], cwd=project_root)
-            _git(["clean", "-fd", "--", ".", _CAPEVOLVE_EXCLUDE], cwd=project_root)
+            _git(["clean", "-fd", "--", *pathspecs[1:]], cwd=project_root)
             _git(["checkout", current_branch], cwd=project_root)
             _git(["branch", "-D", branch], cwd=project_root)
-        else:
-            _git(["checkout", current_branch], cwd=project_root)
+        except subprocess.CalledProcessError as rollback_exc:
+            # A rollback step itself failing must not silently replace the
+            # real apply failure above — surface both, and tell the user
+            # exactly which branch they were left on so they can recover.
+            stderr = (rollback_exc.stderr or rollback_exc.stdout or "").strip()
+            raise RuntimeError(
+                f"{apply_error}; rollback could not finish either ({stderr}); "
+                f"the repository may still be on branch {branch!r} with a "
+                f"partial copy — `git status` and `git checkout {current_branch}` "
+                "to recover by hand"
+            ) from exc
+        raise apply_error from exc
+    _git(["checkout", current_branch], cwd=project_root)
 
     # The optimistic-bias caveat needs real split sizes. cap-evolve freezes
     # the split to run_dir/splits.json (confirmed on-disk file, not a

@@ -99,6 +99,9 @@ def snapshot_candidate(components: list[dict], destination: Path) -> None:
     """Copy each resolved candidate component into *destination* (the seed capability)."""
     destination = Path(destination)
     if destination.exists():
+        resolved = destination.resolve()
+        if resolved in (Path(resolved.root), Path.home().resolve()):
+            raise ValueError(f"refusing to delete a protected directory: {resolved}")
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
     for component in components:
