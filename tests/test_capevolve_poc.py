@@ -90,6 +90,12 @@ def _make_bridge(tmp_path, task_ids=("case-1",)):
 
 # ── agent_eval.optimize.artifact: candidate overlay (engine-agnostic) ───────
 
+def test_snapshot_candidate_refuses_to_delete_a_protected_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    with pytest.raises(ValueError, match="protected directory"):
+        artifact.snapshot_candidate([], tmp_path)
+
+
 def test_candidate_overlay_detaches_project_symlink(tmp_path):
     project_skills = tmp_path / "project" / "skills"
     skill = project_skills / "demo"
@@ -480,10 +486,9 @@ def test_local_rollout_writes_the_standard_report_and_tolerates_its_failure(tmp_
 
 
 def test_run_script_times_out_instead_of_hanging_forever(tmp_path, monkeypatch):
-    """The local substrate had no cap at all (unlike Harbor's --agent-timeout,
-    rollout.py:442): a hung step (network stall, runaway agent loop) blocked
-    the whole campaign forever, since max_usd never gets the chance to
-    trigger if nothing returns."""
+    """The local substrate's subprocess calls had no cap at all: a hung step
+    (network stall, runaway agent loop) blocked the whole campaign forever,
+    since max_usd never gets the chance to trigger if nothing returns."""
     script = tmp_path / "skills" / "eval-run" / "scripts" / "execute.py"
     script.parent.mkdir(parents=True)
     script.write_text("", encoding="utf-8")
@@ -498,7 +503,42 @@ def test_run_script_times_out_instead_of_hanging_forever(tmp_path, monkeypatch):
         rollout._run_script(manifest, "execute.py", "--output", str(tmp_path))
 
 
+def test_run_harness_times_out_instead_of_hanging_forever(tmp_path, monkeypatch):
+    """The Harbor substrate's own subprocess.run (task generation, then
+    agent_eval.harbor.run) had no cap either, unlike the per-agent
+    --agent-timeout it passes INTO harbor.py — a hang in generation or
+    container setup, outside any agent call, still blocked the campaign
+    forever."""
+    manifest = {"project_root": str(tmp_path), "agent_timeout_s": 10}
+
+    def _fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"), output=b"", stderr=b"stuck on container setup")
+
+    monkeypatch.setattr(rollout.subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="timed out after 910s"):
+        rollout._run_harness(manifest, ["agent_eval.harbor.run"])
+
+
 # ── agent_eval.engines.capevolve: scaffolding ────────────────────────────────
+
+@pytest.mark.parametrize("bad_max_usd", [float("nan"), float("inf"), float("-inf")])
+def test_prepare_project_rejects_non_finite_max_usd(tmp_path, monkeypatch, bad_max_usd):
+    """nan compares False against everything (`<= 0` never rejects it) and
+    inf passes a bare positivity check, so either would otherwise reach the
+    generated spec and the launch command uncaught."""
+    monkeypatch.chdir(tmp_path)
+    _bare_benchmark(tmp_path)
+    with pytest.raises(ValueError, match="finite"):
+        capevolve.prepare_project(max_usd=bad_max_usd)
+
+
+def test_prepare_project_rejects_non_finite_split_ratios(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _bare_benchmark(tmp_path)
+    with pytest.raises(ValueError, match="finite"):
+        capevolve.prepare_project(max_usd=5, split_ratios=(float("nan"), 0.25, 0.25))
+
 
 def test_prepare_project_generates_adapter_seed_and_search_spec(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
@@ -1074,12 +1114,13 @@ def test_intake_runtime_resources_follow_code_paths_and_skip_measurement(tmp_pat
     config = EvalConfig.from_yaml("eval.yaml")
     components = [{"source": str(tmp_path / ".claude/skills/pipeline")}]
 
-    resources = intake.runtime_resources(tmp_path, config, components)
+    resources, warnings = intake.runtime_resources(tmp_path, config, components)
 
     # scripts (harness default) and types (read by a script) are carried;
     # the dataset (gold), eval profiles (judges), tests and unreferenced
     # docs never reach the agent's workspace.
     assert resources == ["scripts", "types"]
+    assert warnings == []
 
 
 def test_intake_runtime_resources_honors_execution_symlinks(tmp_path, monkeypatch):
@@ -1104,9 +1145,34 @@ def test_intake_runtime_resources_honors_execution_symlinks(tmp_path, monkeypatc
     config = EvalConfig.from_yaml("eval.yaml")
     components = [{"source": str(tmp_path / ".claude/skills/pipeline")}]
 
-    resources = intake.runtime_resources(tmp_path, config, components)
+    resources, warnings = intake.runtime_resources(tmp_path, config, components)
 
     assert "project_templates" in resources
+    assert warnings == []
+
+
+def test_intake_warns_once_for_a_missing_execution_symlinks_entry(tmp_path, monkeypatch):
+    """A configured entry that isn't a default, and isn't found under the
+    project root, is a configuration mistake (not the normal "project
+    doesn't have this default" case) — it must warn, not fail silently,
+    so a user sees it without re-discovering it from a bad rollout result."""
+    monkeypatch.chdir(tmp_path)
+    _bare_benchmark(tmp_path)
+    (tmp_path / "eval.yaml").write_text(
+        (tmp_path / "eval.yaml").read_text(encoding="utf-8").replace(
+            "execution:\n  mode:", "execution:\n  symlinks: [does_not_exist]\n  mode:"
+        ),
+        encoding="utf-8",
+    )
+    from agent_eval.config import EvalConfig
+    config = EvalConfig.from_yaml("eval.yaml")
+    components = [{"source": str(tmp_path / ".claude/skills/pipeline")}]
+
+    resources, warnings = intake.runtime_resources(tmp_path, config, components)
+
+    assert "does_not_exist" not in resources
+    assert len(warnings) == 1
+    assert "does_not_exist" in warnings[0]
 
 
 def test_intake_never_ships_a_harness_reserved_workspace_name(tmp_path, monkeypatch):
@@ -1120,7 +1186,7 @@ def test_intake_never_ships_a_harness_reserved_workspace_name(tmp_path, monkeypa
     (tmp_path / ".claude/settings.json").write_text(
         '{"hooks": {"SessionStart": [{"command": "bash hooks/context.sh"}]}}', encoding="utf-8")
     from agent_eval.config import EvalConfig
-    resources = intake.runtime_resources(
+    resources, _ = intake.runtime_resources(
         tmp_path, EvalConfig.from_yaml("eval.yaml"), [{"source": str(tmp_path / ".claude/skills/pipeline")}])
     assert "hooks" not in resources
 
@@ -1423,15 +1489,36 @@ def test_run_target_converts_invoke_rollout_failures_to_errored_rollout(tmp_path
     task = bridge_template.Task(id="case-1")
 
     def _raise(*args, **kwargs):
-        raise RuntimeError("rollout subprocess failed")
+        raise RuntimeError("rollout subprocess failed: ModuleNotFoundError: no module named 'cap_evolve'")
     monkeypatch.setattr(bridge, "_invoke_rollout", _raise)
 
     result = bridge.run_target(task, str(tmp_path), seed=0)
     assert result.error is not None
+    # The real cause (what _invoke_rollout put into str(exc)) must survive
+    # into Rollout.error — this is the only place a crash is visible, and
+    # /eval-optimize's SKILL.md tells users to find it in the campaign log.
+    assert "ModuleNotFoundError" in result.error
     # score() must then mark this as missing data too.
     score = bridge.score(task, result)
     assert score.reward == 0.0
     assert score.raw.get("errored") is True
+
+
+def test_invoke_rollout_times_out_instead_of_hanging_forever(tmp_path, monkeypatch):
+    """Unlike the local substrate's _run_script, the bridge's own subprocess
+    call had no cap at all: a hang anywhere in the rollout (workspace/
+    execute/collect/score/report, or Harbor generation+execution) blocked
+    the campaign forever, since max_usd never gets the chance to trigger
+    if this call never returns."""
+    bridge = _make_bridge(tmp_path)
+
+    def _fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"), output=b"", stderr=b"stuck")
+
+    monkeypatch.setattr(bridge_template.subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        bridge._invoke_rollout("case-1", tmp_path, seed=0)
 
 
 def test_run_target_is_thread_safe_across_concurrent_calls(tmp_path, monkeypatch):
@@ -1915,6 +2002,63 @@ def test_apply_winner_ignores_the_configured_runs_dir_when_checking_dirty(tmp_pa
     assert result["best_id"] == "cand_1"
 
 
+def test_apply_winner_tolerates_an_absolute_runs_dir_outside_the_repo(tmp_path, monkeypatch):
+    """export.runs_dir_for supports an absolute AGENT_EVAL_RUNS_DIR outside
+    the project (its own docstring). git's `:(exclude)` pathspec hard-errors
+    on a path outside the worktree, so adding that exclude unconditionally
+    turned every --apply into a fatal `git status` failure for such a
+    setup, instead of just skipping the (inapplicable) exclude."""
+    project_root, harness_manifest, campaign_manifest, skill_path = _apply_fixture(
+        tmp_path, winning_skill_content="improved skill"
+    )
+    outside_runs_dir = tmp_path / "outside-runs"
+    outside_runs_dir.mkdir()
+    monkeypatch.setenv("AGENT_EVAL_RUNS_DIR", str(outside_runs_dir))
+
+    result = capevolve.apply_winner(
+        project_root=project_root,
+        harness_manifest=harness_manifest, campaign_manifest=campaign_manifest,
+    )
+
+    assert result["best_id"] == "cand_1"
+
+
+def test_apply_winner_chains_the_original_error_when_rollback_also_fails(tmp_path, monkeypatch):
+    """A `finally` block that raises replaces whatever was propagating from
+    the try body (CPython: the original is not even in __context__ unless
+    the new error is chained `from` it) — a failing rollback step must not
+    silently stand in for the real apply failure."""
+    project_root, harness_manifest, campaign_manifest, skill_path = _apply_fixture(tmp_path)
+    real_git = capevolve._git
+    original_branch = capevolve._git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=project_root).stdout.strip()
+
+    def _fake_git(args, cwd, **kwargs):
+        # Fail the real apply (the `git commit` inside the try) AND the
+        # rollback's checkout-back, to exercise both exception paths at once.
+        if args[0] == "commit":
+            raise subprocess.CalledProcessError(1, args, output="", stderr="commit rejected: hook failed")
+        if args == ["checkout", original_branch]:
+            raise subprocess.CalledProcessError(128, args, output="", stderr="checkout refused: dirty")
+        return real_git(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(capevolve, "_git", _fake_git)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        capevolve.apply_winner(
+            project_root=project_root,
+            harness_manifest=harness_manifest, campaign_manifest=campaign_manifest,
+        )
+
+    # The original apply failure is still present in the message raised to
+    # the caller (not silently replaced by the rollback's own
+    # CalledProcessError), and the rollback failure is appended alongside
+    # it, with recovery guidance.
+    message = str(exc_info.value)
+    assert "commit rejected: hook failed" in message
+    assert "rollback could not finish" in message
+    assert "checkout refused: dirty" in message
+
+
 # ── cap-evolve install: pinned package + matching skills tree ────────────────
 
 def _skills_tree(root: Path) -> Path:
@@ -2192,7 +2336,6 @@ def test_stop_campaign_kills_the_process_group_not_just_the_leader(tmp_path, mon
     capevolve._write_campaign_manifest(project_dir, {
         "pid": 999, "create_time": "123", "run_dir": str(tmp_path / "run_x"),
     })
-    monkeypatch.setattr(capevolve, "_is_alive", lambda pid, ct: True)
     killed = {}
     monkeypatch.setattr(capevolve.os, "killpg", lambda pid, sig: killed.update(pid=pid, sig=sig))
 
@@ -2200,6 +2343,29 @@ def test_stop_campaign_kills_the_process_group_not_just_the_leader(tmp_path, mon
 
     assert killed == {"pid": 999, "sig": capevolve.signal.SIGTERM}
     assert result["status"] == "stopped"
+
+
+def test_stop_campaign_reports_already_stopped_when_the_group_has_no_members(tmp_path, monkeypatch):
+    """The leader exiting while a rollout/claude child is still in its
+    process group is exactly the case --stop exists for, so this must not
+    pre-check the leader's own liveness (_is_alive) and skip the kill —
+    POSIX never reuses a pgid while it still has live members, so the
+    kill itself (not a liveness pre-check) is the correct signal of
+    whether anything is left to stop."""
+    project_dir = tmp_path / ".capevolve" / "project"
+    project_dir.mkdir(parents=True)
+    capevolve._write_campaign_manifest(project_dir, {
+        "pid": 999, "create_time": "123", "run_dir": str(tmp_path / "run_x"),
+    })
+
+    def _raise(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(capevolve.os, "killpg", _raise)
+
+    result = capevolve.stop_campaign(project_dir)
+
+    assert result == {"status": "already_stopped", "pid": 999}
 
 
 def test_cap_evolve_children_get_the_resolved_skills_dir(tmp_path):
